@@ -38,17 +38,20 @@ def _ensure_output_dir():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 
-def plot_par_curves(tier_summary_df: pd.DataFrame) -> None:
+def plot_par_curves(tier_summary_df: pd.DataFrame, replacement_ranks: dict | None = None, suffix: str = "") -> None:
     """
     Chart 1 — Multi-line PAR curve by positional rank for all positions.
-    Saves to output/par_curves_by_position.png.
+    Saves to output/par_curves_by_position{suffix}.png.
     """
+    if replacement_ranks is None:
+        replacement_ranks = REPLACEMENT_RANKS
+
     _ensure_output_dir()
 
     fig, ax = plt.subplots(figsize=(12, 7))
 
     for position in POSITION_ORDER:
-        max_rank = REPLACEMENT_RANKS.get(position, 12)
+        max_rank = replacement_ranks.get(position, 12)
         pos_df = tier_summary_df[
             (tier_summary_df["position"] == position)
             & (tier_summary_df["positional_rank"] <= max_rank)
@@ -78,7 +81,7 @@ def plot_par_curves(tier_summary_df: pd.DataFrame) -> None:
     ax.grid(True, color="lightgray", alpha=0.3)
 
     plt.tight_layout()
-    out_path = os.path.join(OUTPUT_DIR, "par_curves_by_position.png")
+    out_path = os.path.join(OUTPUT_DIR, f"par_curves_by_position{suffix}.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
@@ -87,14 +90,14 @@ def plot_par_curves(tier_summary_df: pd.DataFrame) -> None:
     positions_in_legend = [position for position in POSITION_ORDER
                            if not tier_summary_df[
                                (tier_summary_df["position"] == position)
-                               & (tier_summary_df["positional_rank"] <= REPLACEMENT_RANKS.get(position, 12))
+                               & (tier_summary_df["positional_rank"] <= replacement_ranks.get(position, 12))
                            ].empty]
     print(f"Chart 1 validation — Positions plotted: {positions_in_legend}")
 
     for pos in ["RB", "WR"]:
-        max_r = REPLACEMENT_RANKS.get(pos, 0)
+        max_r = replacement_ranks.get(pos, 0)
         for shorter_pos in ["QB", "TE"]:
-            short_r = REPLACEMENT_RANKS.get(shorter_pos, 0)
+            short_r = replacement_ranks.get(shorter_pos, 0)
             if max_r > short_r:
                 print(f"  OK: {pos} line (rank 1–{max_r}) extends further right than {shorter_pos} (rank 1–{short_r}).")
 
@@ -123,12 +126,13 @@ def _build_player_lookup(fantasy_df: pd.DataFrame) -> dict:
 def plot_auction_value_top20(
     cross_position_ranking_df: pd.DataFrame,
     fantasy_df: Optional[pd.DataFrame] = None,
+    suffix: str = "",
 ) -> None:
     """
     Chart 2 — Horizontal bar chart for the top 20 roster slots by auction value.
     If fantasy_df is provided, each bar is annotated with the players who held
     that positional rank across all seasons, from most recent to oldest, separated by " | ".
-    Saves to output/auction_value_top20.png.
+    Saves to output/auction_value_top20{suffix}.png.
     """
     _ensure_output_dir()
 
@@ -160,7 +164,8 @@ def plot_auction_value_top20(
         if fantasy_df is not None:
             season_players = player_lookup.get((row["position"], int(row["positional_rank"])), [])
             if season_players:
-                names_str = " | ".join(name for _, name in season_players)
+                # Reverse so most recent season appears rightmost (right-aligned text)
+                names_str = " | ".join(name for _, name in reversed(season_players))
                 ax.text(
                     bar_width * 0.98, bar_mid_y,
                     names_str,
@@ -186,28 +191,31 @@ def plot_auction_value_top20(
     ax.set_xlim(0, top20["auction_value"].max() * 1.15)
 
     plt.tight_layout()
-    out_path = os.path.join(OUTPUT_DIR, "auction_value_top20.png")
+    out_path = os.path.join(OUTPUT_DIR, f"auction_value_top20{suffix}.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
 
 
-def plot_par_heatmap(tier_summary_df: pd.DataFrame) -> None:
+def plot_par_heatmap(tier_summary_df: pd.DataFrame, replacement_ranks: dict | None = None, suffix: str = "") -> None:
     """
     Chart 3 (optional) — Heatmap of mean PAR by position and rank bins.
-    Saves to output/par_heatmap.png.
+    Saves to output/par_heatmap{suffix}.png.
     """
+    if replacement_ranks is None:
+        replacement_ranks = REPLACEMENT_RANKS
+
     _ensure_output_dir()
 
     bin_size = 5
-    max_rank = max(REPLACEMENT_RANKS.values())
+    max_rank = max(replacement_ranks.values())
     bins = list(range(1, max_rank + 2, bin_size))
     bin_labels = [f"{b}–{b + bin_size - 1}" for b in bins[:-1]]
 
     heatmap_data = []
     for position in POSITION_ORDER:
         row_vals = []
-        max_r = REPLACEMENT_RANKS.get(position, 12)
+        max_r = replacement_ranks.get(position, 12)
         pos_df = tier_summary_df[
             (tier_summary_df["position"] == position)
             & (tier_summary_df["positional_rank"] <= max_r)
@@ -235,18 +243,18 @@ def plot_par_heatmap(tier_summary_df: pd.DataFrame) -> None:
     ax.set_xlabel("Positional Rank Bin", fontsize=11)
 
     plt.tight_layout()
-    out_path = os.path.join(OUTPUT_DIR, "par_heatmap.png")
+    out_path = os.path.join(OUTPUT_DIR, f"par_heatmap{suffix}.png")
     fig.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close(fig)
     print(f"Saved: {out_path}")
 
 
-def export_csv(tier_summary_df: pd.DataFrame, cross_position_ranking_df: pd.DataFrame) -> None:
+def export_csv(tier_summary_df: pd.DataFrame, cross_position_ranking_df: pd.DataFrame, suffix: str = "") -> None:
     """Export tier summary and cross-position ranking to CSV files."""
     os.makedirs(DATA_DIR, exist_ok=True)
 
-    tier_path = os.path.join(DATA_DIR, "tier_summary.csv")
-    cross_path = os.path.join(DATA_DIR, "cross_position_ranking.csv")
+    tier_path = os.path.join(DATA_DIR, f"tier_summary{suffix}.csv")
+    cross_path = os.path.join(DATA_DIR, f"cross_position_ranking{suffix}.csv")
 
     tier_summary_df.to_csv(tier_path, index=False)
     print(f"Saved: {tier_path}")
@@ -259,21 +267,26 @@ def visualize_and_export(
     tier_summary_df: pd.DataFrame,
     cross_position_ranking_df: pd.DataFrame,
     fantasy_df: Optional[pd.DataFrame] = None,
+    replacement_ranks: dict | None = None,
+    suffix: str = "",
 ) -> None:
     """
     Main entry point for step 5.
     Generates all charts and exports CSV files.
+
+    suffix: appended to all output filenames (e.g. "_waiver" -> par_curves_by_position_waiver.png)
+    replacement_ranks: override for positional rank cutoffs used in chart axes/labels
     """
     print("\n=== Step 5: Visualize and Export Results ===")
 
     print("\n--- Chart 1: PAR curves by position ---")
-    plot_par_curves(tier_summary_df)
+    plot_par_curves(tier_summary_df, replacement_ranks=replacement_ranks, suffix=suffix)
 
     print("\n--- Chart 2: Auction value top 20 ---")
-    plot_auction_value_top20(cross_position_ranking_df, fantasy_df=fantasy_df)
+    plot_auction_value_top20(cross_position_ranking_df, fantasy_df=fantasy_df, suffix=suffix)
 
     print("\n--- Chart 3: PAR heatmap ---")
-    plot_par_heatmap(tier_summary_df)
+    plot_par_heatmap(tier_summary_df, replacement_ranks=replacement_ranks, suffix=suffix)
 
     print("\n--- Exporting CSVs ---")
-    export_csv(tier_summary_df, cross_position_ranking_df)
+    export_csv(tier_summary_df, cross_position_ranking_df, suffix=suffix)

@@ -1,6 +1,7 @@
 """
 Step 3 of Goal 3: Calculate Points Above Replacement (PAR) per player.
 """
+from __future__ import annotations
 
 import math
 import pandas as pd
@@ -16,17 +17,20 @@ REPLACEMENT_RANKS = {
 }
 
 
-def get_replacement_baselines(df: pd.DataFrame) -> dict:
+def get_replacement_baselines(df: pd.DataFrame, replacement_ranks: dict | None = None) -> dict:
     """
     For each (position, season), look up the points of the replacement-level player.
     Falls back to the last-ranked player if the replacement rank exceeds the pool size.
 
     Returns a dict keyed by (position, season) -> replacement_points (float).
     """
+    if replacement_ranks is None:
+        replacement_ranks = REPLACEMENT_RANKS
+
     baselines = {}
 
     for (position, season), group in df.groupby(["position", "season"]):
-        rep_rank = REPLACEMENT_RANKS[position]
+        rep_rank = replacement_ranks[position]
         max_rank = group["positional_rank"].max()
 
         if rep_rank > max_rank:
@@ -51,12 +55,17 @@ def get_replacement_baselines(df: pd.DataFrame) -> dict:
     return baselines
 
 
-def calculate_par(df: pd.DataFrame) -> pd.DataFrame:
+def calculate_par(df: pd.DataFrame, replacement_ranks: dict | None = None) -> pd.DataFrame:
     """
     Add a 'par' column to the DataFrame representing Points Above Replacement.
     PAR = half_ppr_points - replacement_points for the player's (position, season).
+
+    If replacement_ranks is provided, it overrides the module-level REPLACEMENT_RANKS.
     """
-    baselines = get_replacement_baselines(df)
+    if replacement_ranks is None:
+        replacement_ranks = REPLACEMENT_RANKS
+
+    baselines = get_replacement_baselines(df, replacement_ranks)
 
     # Print replacement-level baselines as a sanity check
     print("\nReplacement-level points per position per season:")
@@ -85,7 +94,7 @@ def calculate_par(df: pd.DataFrame) -> pd.DataFrame:
         rep_players = df[
             (df["position"] == position)
             & (df["season"] == season)
-            & (df["positional_rank"] == REPLACEMENT_RANKS.get(position))
+            & (df["positional_rank"] == replacement_ranks.get(position))
         ]
         if not rep_players.empty:
             for _, row in rep_players.iterrows():

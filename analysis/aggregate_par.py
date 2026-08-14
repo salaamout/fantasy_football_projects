@@ -57,17 +57,22 @@ def summarize_par_by_tier(df: pd.DataFrame) -> pd.DataFrame:
     return tier_df
 
 
-def convert_par_to_auction_values(tier_df: pd.DataFrame) -> pd.DataFrame:
+def convert_par_to_auction_values(tier_df: pd.DataFrame, starter_slots: dict | None = None) -> pd.DataFrame:
     """
     Step B: Convert mean PAR to auction dollar values.
     Distributes $2,280 (total starter dollars) proportional to positive PAR
     across all defined starter slots.
+
+    If starter_slots is provided, it overrides the module-level STARTER_SLOTS.
     """
+    if starter_slots is None:
+        starter_slots = STARTER_SLOTS
+
     tier_df = tier_df.copy()
 
     # Flag rows that are starter slots per league settings
     def is_starter(row):
-        return row["positional_rank"] in STARTER_SLOTS.get(row["position"], range(0))
+        return row["positional_rank"] in starter_slots.get(row["position"], range(0))
 
     tier_df["is_starter"] = tier_df.apply(is_starter, axis=1)
 
@@ -102,8 +107,11 @@ def build_cross_position_ranking(tier_df: pd.DataFrame) -> pd.DataFrame:
     return cross_df
 
 
-def validate_results(tier_df: pd.DataFrame, cross_df: pd.DataFrame) -> None:
+def validate_results(tier_df: pd.DataFrame, cross_df: pd.DataFrame, starter_slots: dict | None = None) -> None:
     """Run validation checks on the aggregated results."""
+    if starter_slots is None:
+        starter_slots = STARTER_SLOTS
+
     # Check total auction value sums to ~$2,280
     total_av = tier_df.loc[tier_df["is_starter"], "auction_value"].sum()
     print(f"\nValidation: Total auction value across starter slots = ${total_av:,} (target: ${TOTAL_STARTER_DOLLARS:,})")
@@ -111,7 +119,7 @@ def validate_results(tier_df: pd.DataFrame, cross_df: pd.DataFrame) -> None:
         print(f"  WARNING: Total auction value deviates from target by ${abs(total_av - TOTAL_STARTER_DOLLARS)}.")
 
     # Check rank 1 at each position has the highest auction value within that position
-    for position in STARTER_SLOTS:
+    for position in starter_slots:
         pos_df = tier_df[(tier_df["position"] == position) & tier_df["is_starter"]]
         if pos_df.empty:
             continue
@@ -132,9 +140,12 @@ def validate_results(tier_df: pd.DataFrame, cross_df: pd.DataFrame) -> None:
     print(top10.to_string(index=False))
 
 
-def aggregate_par(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+def aggregate_par(df: pd.DataFrame, starter_slots: dict | None = None) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Main entry point for step 4.
+
+    If starter_slots is provided, it overrides the module-level STARTER_SLOTS.
+
     Returns:
         tier_summary_df: one row per (position, positional_rank) with PAR stats and auction_value
         cross_position_ranking_df: all starter slots sorted by auction_value descending
@@ -145,12 +156,12 @@ def aggregate_par(df: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     print(f"\nTier summary shape: {tier_df.shape} (position × rank combinations)")
 
     print("\n=== Step B: Convert PAR to auction dollar values ===")
-    tier_df = convert_par_to_auction_values(tier_df)
+    tier_df = convert_par_to_auction_values(tier_df, starter_slots=starter_slots)
 
     print("\n=== Step C: Build cross-position ranking ===")
     cross_df = build_cross_position_ranking(tier_df)
 
-    validate_results(tier_df, cross_df)
+    validate_results(tier_df, cross_df, starter_slots=starter_slots)
 
     return tier_df, cross_df
 
