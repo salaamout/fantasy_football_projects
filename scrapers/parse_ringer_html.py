@@ -4,8 +4,8 @@ from pathlib import Path
 from bs4 import BeautifulSoup
 import pandas as pd
 
-HTML_PATH = Path("data/2026 Ringer Preseason Fantasy Football Rankings _ The Ringer Fantasy Football.html")
-OUT_PATH  = Path("data/ringer_2026_rankings.csv")
+HTML_PATH = Path(__file__).parent.parent / "data" / "2026 Ringer Preseason Fantasy Football Rankings _ The Ringer Fantasy Football.html"
+OUT_PATH  = Path(__file__).parent.parent / "data" / "ringer_2026_rankings.csv"
 FORMAT    = "half-ppr"
 
 

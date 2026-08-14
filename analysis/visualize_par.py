@@ -2,6 +2,7 @@
 Step 5 of Goal 3: Visualize PAR curves and auction values, and export results.
 """
 
+from __future__ import annotations
 import os
 import pandas as pd
 import matplotlib

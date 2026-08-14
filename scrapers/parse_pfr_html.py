@@ -1,14 +1,15 @@
+from __future__ import annotations
 from bs4 import BeautifulSoup
 import pandas as pd
-import os
+from pathlib import Path
 
-HTML_PATH = "data/2025 NFL Fantasy Rankings _ Pro-Football-Reference.com.html"
-OUT_CSV   = "data/fantasy_half_ppr.csv"
+HTML_PATH = Path(__file__).parent.parent / "data" / "2025 NFL Fantasy Rankings _ Pro-Football-Reference.com.html"
+OUT_CSV   = str(Path(__file__).parent.parent / "data" / "fantasy_half_ppr.csv")
 SEASON    = 2025
 POSITIONS = {"QB", "RB", "WR", "TE"}
 
 
-def parse_pfr_html(html_path: str, season: int) -> pd.DataFrame:
+def parse_pfr_html(html_path: Path | str, season: int) -> pd.DataFrame:
     with open(html_path, encoding="utf-8") as f:
         soup = BeautifulSoup(f, "lxml")
 

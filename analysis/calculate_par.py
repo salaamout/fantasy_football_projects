@@ -4,8 +4,15 @@ Step 3 of Goal 3: Calculate Points Above Replacement (PAR) per player.
 from __future__ import annotations
 
 import math
+import sys
+from pathlib import Path
 import pandas as pd
-from load_fantasy_data import load_and_clean_data
+
+try:
+    from .load_fantasy_data import load_and_clean_data
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from load_fantasy_data import load_and_clean_data
 
 # Replacement-level positional rank thresholds (1-indexed)
 REPLACEMENT_RANKS = {
@@ -55,7 +62,7 @@ def get_replacement_baselines(df: pd.DataFrame, replacement_ranks: dict | None =
     return baselines
 
 
-def calculate_par(df: pd.DataFrame, replacement_ranks: dict | None = None) -> pd.DataFrame:
+def calculate_par(df: pd.DataFrame, replacement_ranks: dict | None = None, verbose: bool = False) -> pd.DataFrame:
     """
     Add a 'par' column to the DataFrame representing Points Above Replacement.
     PAR = half_ppr_points - replacement_points for the player's (position, season).
@@ -68,17 +75,18 @@ def calculate_par(df: pd.DataFrame, replacement_ranks: dict | None = None) -> pd
     baselines = get_replacement_baselines(df, replacement_ranks)
 
     # Print replacement-level baselines as a sanity check
-    print("\nReplacement-level points per position per season:")
-    baseline_rows = [
-        {"position": pos, "season": season, "replacement_points": pts}
-        for (pos, season), pts in sorted(baselines.items())
-    ]
-    baseline_df = pd.DataFrame(baseline_rows)
-    print(
-        baseline_df.pivot(index="position", columns="season", values="replacement_points")
-        .round(2)
-        .to_string()
-    )
+    if verbose:
+        print("\nReplacement-level points per position per season:")
+        baseline_rows = [
+            {"position": pos, "season": season, "replacement_points": pts}
+            for (pos, season), pts in sorted(baselines.items())
+        ]
+        baseline_df = pd.DataFrame(baseline_rows)
+        print(
+            baseline_df.pivot(index="position", columns="season", values="replacement_points")
+            .round(2)
+            .to_string()
+        )
 
     # Map replacement points onto each player row
     df = df.copy()
@@ -115,8 +123,8 @@ def calculate_par(df: pd.DataFrame, replacement_ranks: dict | None = None) -> pd
 
 
 if __name__ == "__main__":
-    df = load_and_clean_data()
-    df = calculate_par(df)
+    df = load_and_clean_data(verbose=True)
+    df = calculate_par(df, verbose=True)
 
     print("\nSample rows with PAR (top 5 per position for 2024):")
     sample = (

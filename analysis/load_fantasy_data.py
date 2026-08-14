@@ -2,15 +2,17 @@
 Step 2 of Goal 3: Load, clean, and normalize fantasy half-PPR data.
 """
 
+from __future__ import annotations
+from pathlib import Path
 import pandas as pd
 
-DATA_PATH = "data/fantasy_half_ppr.csv"
+DATA_PATH = Path(__file__).parent.parent / "data" / "fantasy_half_ppr.csv"
 EXPECTED_COLUMNS = {"player_display_name", "position", "season", "half_ppr_points"}
 EXPECTED_SEASONS = {2020, 2021, 2022, 2023, 2024}
 VALID_POSITIONS = {"QB", "RB", "WR", "TE", "DST"}
 
 
-def load_and_clean_data(path: str = DATA_PATH) -> pd.DataFrame:
+def load_and_clean_data(path: str | Path = DATA_PATH, verbose: bool = False) -> pd.DataFrame:
     # --- Load ---
     df = pd.read_csv(path)
 
@@ -55,20 +57,21 @@ def load_and_clean_data(path: str = DATA_PATH) -> pd.DataFrame:
         raise ValueError(f"Duplicate rows found after deduplication:\n{df[dupes]}")
 
     # --- Summary ---
-    print(f"Total rows: {len(df)}")
-    print(f"Seasons present: {sorted(df['season'].unique())}")
-    print("\nPlayer count per position per season:")
-    summary = (
-        df.groupby(["position", "season"])["player_display_name"]
-        .count()
-        .unstack(level="season")
-    )
-    print(summary.to_string())
+    if verbose:
+        print(f"Total rows: {len(df)}")
+        print(f"Seasons present: {sorted(df['season'].unique())}")
+        print("\nPlayer count per position per season:")
+        summary = (
+            df.groupby(["position", "season"])["player_display_name"]
+            .count()
+            .unstack(level="season")
+        )
+        print(summary.to_string())
 
     return df
 
 
 if __name__ == "__main__":
-    df = load_and_clean_data()
+    df = load_and_clean_data(verbose=True)
     print("\nSample rows:")
     print(df.head(10).to_string(index=False))

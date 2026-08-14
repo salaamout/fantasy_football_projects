@@ -1,10 +1,28 @@
 """
 Step 4 of Goal 3: Aggregate PAR by roster slot and convert to auction values.
+
+Pass --waiver (or -w) to use waiver-wire replacement ranks instead of the
+default starter replacement ranks.
+
+  Starter replacement ranks : QB13, RB32, WR42, TE13, DST13
+  Waiver  replacement ranks : QB19, RB56, WR66, TE19, DST13
+    (waiver = first player NOT rostered on any of the 12 teams' bench)
 """
 
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
 import pandas as pd
-from load_fantasy_data import load_and_clean_data
-from calculate_par import calculate_par
+
+try:
+    from .load_fantasy_data import load_and_clean_data
+    from .calculate_par import calculate_par
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from load_fantasy_data import load_and_clean_data
+    from calculate_par import calculate_par
 
 # --- League settings ---
 NUM_TEAMS = 12
@@ -23,6 +41,19 @@ STARTER_SLOTS = {
 }
 
 MIN_SEASONS = 2  # Trim tiers with fewer than this many seasons of data
+
+# --- Waiver-wire replacement ranks ---
+# Replacement rank = starters + (12 teams × bench per team) + 1
+# Bench per team: QB 0.5, RB 2.0, WR 2.0, TE 0.5, DST 0.0
+REPLACEMENT_RANKS_WAIVER = {"QB": 19, "RB": 56, "WR": 66, "TE": 19, "DST": 13}
+# Auction value is still distributed across starter slots only
+STARTER_SLOTS_WAIVER = {
+    "QB":  range(1, 13),
+    "RB":  range(1, 32),
+    "WR":  range(1, 42),
+    "TE":  range(1, 13),
+    "DST": range(1, 13),
+}
 
 
 def summarize_par_by_tier(df: pd.DataFrame) -> pd.DataFrame:
@@ -167,12 +198,40 @@ def aggregate_par(df: pd.DataFrame, starter_slots: dict | None = None) -> tuple[
 
 
 if __name__ == "__main__":
-    from visualize_par import visualize_and_export
+    try:
+        from .visualize_par import visualize_and_export
+    except ImportError:
+        from visualize_par import visualize_and_export
 
-    df = load_and_clean_data()
-    df = calculate_par(df)
+    parser = argparse.ArgumentParser(description="Aggregate PAR and compute auction values.")
+    parser.add_argument(
+        "--waiver", "-w",
+        action="store_true",
+        help="Use waiver-wire replacement ranks (starters + bench + 1) instead of starter-only ranks.",
+    )
+    args = parser.parse_args()
 
-    tier_summary_df, cross_position_ranking_df = aggregate_par(df)
+    if args.waiver:
+        replacement_ranks = REPLACEMENT_RANKS_WAIVER
+        starter_slots = STARTER_SLOTS_WAIVER
+        suffix = "_waiver"
+        print("=== Waiver-Wire Replacement Level Analysis ===")
+        print("\nReplacement-level ranks (starters + bench + 1):")
+        _starters = {"QB": 12, "RB": 31, "WR": 41, "TE": 12, "DST": 12}
+        _bench = {"QB": 6, "RB": 24, "WR": 24, "TE": 6, "DST": 0}
+        for pos in sorted(replacement_ranks):
+            s, b, r = _starters[pos], _bench[pos], replacement_ranks[pos]
+            print(f"  {pos}: {s} starters + {b} bench = {s + b} rostered  →  replacement = {pos}{r}")
+    else:
+        replacement_ranks = None  # use module-level defaults in calculate_par
+        starter_slots = None      # use module-level defaults in aggregate_par
+        suffix = ""
+        print("=== Standard Replacement Level Analysis ===")
+
+    df = load_and_clean_data(verbose=True)
+    df = calculate_par(df, replacement_ranks=replacement_ranks, verbose=True)
+
+    tier_summary_df, cross_position_ranking_df = aggregate_par(df, starter_slots=starter_slots)
 
     print("\n=== Tier Summary (starter slots only, sorted by position + rank) ===")
     starter_tiers = (
@@ -196,4 +255,12 @@ if __name__ == "__main__":
         .to_string(index=False)
     )
 
-    visualize_and_export(tier_summary_df, cross_position_ranking_df, fantasy_df=df)
+    visualize_and_export(
+        tier_summary_df,
+        cross_position_ranking_df,
+        fantasy_df=df,
+        replacement_ranks=replacement_ranks,
+        suffix=suffix,
+    )
+
+    print(f"\nDone. Outputs saved{' with ' + repr(suffix) + ' suffix' if suffix else ''}.")

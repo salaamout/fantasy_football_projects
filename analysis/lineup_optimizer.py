@@ -20,11 +20,15 @@ import pandas as pd
 import pulp
 
 # Allow imports from the analysis directory when run directly
-sys.path.insert(0, str(Path(__file__).parent))
-from load_fantasy_data import load_and_clean_data
-from calculate_par import calculate_par, REPLACEMENT_RANKS
+try:
+    from .load_fantasy_data import load_and_clean_data
+    from .calculate_par import calculate_par, REPLACEMENT_RANKS
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).parent))
+    from load_fantasy_data import load_and_clean_data
+    from calculate_par import calculate_par, REPLACEMENT_RANKS
 
-RANKINGS_PATH = Path("data/ringer_2026_rankings.csv")
+RANKINGS_PATH = Path(__file__).parent.parent / "data" / "ringer_2026_rankings.csv"
 BUDGET        = 200
 LINEUP_SLOTS  = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "FLEX": 1}
 FLEX_POSITIONS = {"RB", "WR", "TE"}
