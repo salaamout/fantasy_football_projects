@@ -232,8 +232,154 @@ def optimize_lineup(rankings: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
+ESPN_DATA_PATH   = Path(__file__).parent.parent / "data" / "espn_projected_values.csv"
+ESPN_OUTPUT_PATH = Path(__file__).parent.parent / "output" / "espn_optimized_roster.csv"
+ESPN_LINEUP_SLOTS  = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "FLEX": 1}
+ESPN_BENCH_SLOTS   = 4
+ESPN_FLEX_POSITIONS = {"RB", "WR", "TE"}
+
+# Pre-assigned DST: Texans defence at $1, 7.7 projected pts/game (≈ 130.9 over 17 games)
+TEXANS_DST = {
+    "player_name": "Texans",
+    "position": "DST",
+    "team": "HOU",
+    "overall_rank": None,
+    "positional_rank": None,
+    "auction_value": 1,
+    "projected_points": round(7.7 * 17, 1),  # 130.9
+    "slot": "DST",
+}
+
+
+def optimize_espn_lineup(players_df: pd.DataFrame, budget: int = 200) -> pd.DataFrame:
+    """
+    ILP optimizer for the ESPN salary-cap draft.
+
+    Slots: QB×1, RB×2, WR×3, TE×1, FLEX×1 (RB/WR/TE), DST×1, Bench×4 (any).
+    Objective: maximise sum of projected_points for all selected players.
+    Constraint: total auction_value <= budget.
+
+    DST is pre-assigned to the Texans at $1 / 130.9 projected pts (7.7 pts/game × 17).
+    The remaining $budget-1 is available for the skill-position roster.
+    """
+    # Pre-assign Texans DST; deduct their cost from the available budget
+    dst_row  = TEXANS_DST.copy()
+    skill_budget = budget - dst_row["auction_value"]
+
+    df = players_df.dropna(subset=["projected_points", "auction_value"]).copy()
+    # Exclude DST positions — handled separately
+    df = df[df["position"] != "DST"]
+    df = df[df["auction_value"] > 0].reset_index(drop=True)
+
+    prob = pulp.LpProblem("espn_lineup_optimizer", pulp.LpMaximize)
+
+    players = df.to_dict("records")
+    n = len(players)
+
+    # Decision variables
+    # y[i] = 1 if player fills a dedicated positional starter slot
+    # z[i] = 1 if player fills the FLEX slot (RB/WR/TE only)
+    # b[i] = 1 if player fills a bench slot
+    y = [pulp.LpVariable(f"y_{i}", cat="Binary") for i in range(n)]
+    z = [pulp.LpVariable(f"z_{i}", cat="Binary") for i in range(n)]
+    b = [pulp.LpVariable(f"b_{i}", cat="Binary") for i in range(n)]
+
+    # FLEX only for RB/WR/TE
+    for i, p in enumerate(players):
+        if p["position"] not in ESPN_FLEX_POSITIONS:
+            prob += z[i] == 0
+
+    # Each player can fill at most one slot
+    for i in range(n):
+        prob += y[i] + z[i] + b[i] <= 1
+
+    # Objective: maximise projected points for STARTERS only (y = positional, z = FLEX)
+    # Bench players are not included in the objective so the ILP picks the
+    # highest-scoring starting lineup first, then fills bench slots within budget.
+    prob += pulp.lpSum(
+        p["projected_points"] * (y[i] + z[i])
+        for i, p in enumerate(players)
+    )
+
+    # Budget constraint (DST cost already deducted from skill_budget)
+    prob += pulp.lpSum(
+        p["auction_value"] * (y[i] + z[i] + b[i])
+        for i, p in enumerate(players)
+    ) <= skill_budget
+
+    # Positional starter slot counts
+    for pos, count in ESPN_LINEUP_SLOTS.items():
+        if pos == "FLEX":
+            continue
+        prob += pulp.lpSum(
+            y[i] for i, p in enumerate(players) if p["position"] == pos
+        ) == count
+
+    # Exactly one FLEX slot
+    prob += pulp.lpSum(z) == ESPN_LINEUP_SLOTS["FLEX"]
+
+    # Exactly ESPN_BENCH_SLOTS bench players
+    prob += pulp.lpSum(b) == ESPN_BENCH_SLOTS
+
+    # Bench composition: 1-2 WRs, 1-3 RBs, 0 QBs, 0 TEs
+    bench_wr = pulp.lpSum(b[i] for i, p in enumerate(players) if p["position"] == "WR")
+    bench_rb = pulp.lpSum(b[i] for i, p in enumerate(players) if p["position"] == "RB")
+    prob += bench_wr >= 1
+    prob += bench_wr <= 2
+    prob += bench_rb >= 1
+    prob += bench_rb <= 3
+    for i, p in enumerate(players):
+        if p["position"] in ("QB", "TE"):
+            prob += b[i] == 0
+
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    if pulp.LpStatus[status] != "Optimal":
+        raise RuntimeError(f"No optimal solution found. Status: {pulp.LpStatus[status]}")
+
+    rows = []
+    for i, p in enumerate(players):
+        yv = pulp.value(y[i])
+        zv = pulp.value(z[i])
+        bv = pulp.value(b[i])
+        if yv == 1:
+            rows.append({**p, "slot": p["position"]})
+        elif zv == 1:
+            rows.append({**p, "slot": "FLEX"})
+        elif bv == 1:
+            rows.append({**p, "slot": "Bench"})
+
+    slot_order = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "FLEX": 4, "DST": 5, "Bench": 6}
+    result = pd.DataFrame(rows)
+    result["_slot_order"] = result["slot"].map(slot_order)
+    result = result.sort_values(["_slot_order", "positional_rank"]).drop(columns=["_slot_order"])
+
+    # Prepend the pre-assigned Texans DST
+    dst_df = pd.DataFrame([dst_row])
+    result = pd.concat([dst_df, result], ignore_index=True)
+
+    # Points per game (projected season total / 17 regular-season games)
+    result["ppg"] = (result["projected_points"] / 17).round(1)
+
+    return result
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fantasy football lineup optimizer.")
+    parser.add_argument(
+        "--espn",
+        action="store_true",
+        help=(
+            "Run the ESPN salary-cap optimizer instead of the Ringer PAR optimizer. "
+            "Reads data/espn_projected_values.csv and maximises projected_points."
+        ),
+    )
+    parser.add_argument(
+        "--budget",
+        type=int,
+        default=200,
+        metavar="DOLLARS",
+        help="Salary-cap budget for the ESPN optimizer (default: $200).",
+    )
     parser.add_argument(
         "--waiver", "-w",
         action="store_true",
@@ -255,8 +401,63 @@ if __name__ == "__main__":
             "Defaults to 0 (use exact rank)."
         ),
     )
+    parser.add_argument(
+        "--boost", "-b",
+        type=float,
+        default=0.0,
+        metavar="PCT",
+        help=(
+            "Increase all player auction costs (auction_value) by PCT%% before "
+            "optimizing. E.g. --boost 10 raises every cost by 10%%. Models a more "
+            "expensive draft environment where players cost more relative to the "
+            "fixed budget. Defaults to 0 (no boost)."
+        ),
+    )
     args = parser.parse_args()
 
+    # ------------------------------------------------------------------ ESPN --
+    if args.espn:
+        print(f"Loading ESPN projected values from {ESPN_DATA_PATH}…")
+        espn_df = pd.read_csv(ESPN_DATA_PATH)
+        before = len(espn_df)
+        espn_df = espn_df.dropna(subset=["projected_points", "auction_value"])
+        dropped = before - len(espn_df)
+        if dropped:
+            print(f"  Dropped {dropped} players with missing projected_points or auction_value.")
+        print(f"  {len(espn_df)} players available.")
+
+        if args.boost:
+            espn_df = espn_df.copy()
+            espn_df["auction_value"] = (espn_df["auction_value"] * (1 + args.boost / 100)).round(1)
+            print(f"  Boost applied: auction_value increased by {args.boost:g}%.")
+
+        print(f"\nRunning ESPN salary-cap optimizer (budget: ${args.budget})…")
+        roster = optimize_espn_lineup(espn_df, budget=args.budget)
+
+        starters = roster[roster["slot"] != "Bench"]
+        bench    = roster[roster["slot"] == "Bench"]
+        total_cost   = roster["auction_value"].sum()
+        total_pts    = roster["projected_points"].sum()
+        starter_pts  = starters["projected_points"].sum()
+
+        print(f"\n=== ESPN Salary-Cap Optimal Roster (Budget: ${args.budget}) ===")
+        display_cols = ["slot", "position", "player_name", "team",
+                        "overall_rank", "auction_value", "projected_points", "ppg"]
+        print("\n--- Starters ---")
+        print(starters[display_cols].to_string(index=False))
+        print("\n--- Bench ---")
+        print(bench[display_cols].to_string(index=False))
+        print(f"\nTotal auction cost        : ${total_cost}")
+        print(f"Remaining budget          : ${args.budget - total_cost}")
+        print(f"Total projected pts (all) : {total_pts:.1f}")
+        print(f"Starter projected pts     : {starter_pts:.1f}")
+
+        ESPN_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
+        roster.to_csv(ESPN_OUTPUT_PATH, index=False)
+        print(f"\nRoster saved to {ESPN_OUTPUT_PATH}")
+        sys.exit(0)
+
+    # --------------------------------------------------------------- Ringer --
     if args.waiver:
         repl_ranks      = REPLACEMENT_RANKS_WAIVER
         flex_repl_rank  = FLEX_REPLACEMENT_RANK_WAIVER
@@ -270,9 +471,11 @@ if __name__ == "__main__":
     uncertainty_label = (
         f"±{rank_window} rank window" if rank_window > 0 else "exact rank"
     )
+    boost_label = f"+{args.boost:g}% cost boost" if args.boost else "no cost boost"
 
     print(f"Replacement level mode : {mode_label}")
     print(f"Rank uncertainty       : {uncertainty_label}")
+    print(f"Player cost boost      : {boost_label}")
     print("Building historical average PAR lookup tables…")
     pos_lookup, flex_lookup = build_avg_par_lookup(
         replacement_ranks=repl_ranks,
@@ -287,6 +490,10 @@ if __name__ == "__main__":
 
     rankings = attach_expected_par(rankings, pos_lookup, flex_lookup, rank_window=rank_window)
 
+    if args.boost:
+        rankings["auction_value"] = (rankings["auction_value"] * (1 + args.boost / 100)).round(1)
+        print(f"  Boost applied: auction_value increased by {args.boost:g}%.")
+
     print("\nRunning lineup optimizer…")
     lineup = optimize_lineup(rankings)
 
@@ -299,7 +506,7 @@ if __name__ == "__main__":
     total_cost = lineup["auction_value"].sum()
     total_par  = lineup["slot_par"].sum()
 
-    print(f"\n=== Optimal Starting Lineup (Budget: ${BUDGET}) — {mode_label} PAR | {uncertainty_label} ===")
+    print(f"\n=== Optimal Starting Lineup (Budget: ${BUDGET}) — {mode_label} PAR | {uncertainty_label} | {boost_label} ===")
     print(
         lineup[["slot", "position", "player_name", "team", "positional_rank",
                  "auction_value", "slot_par"]]

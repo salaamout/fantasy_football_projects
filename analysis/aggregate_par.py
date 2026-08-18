@@ -1,17 +1,13 @@
 """
 Step 4 of Goal 3: Aggregate PAR by roster slot and convert to auction values.
 
-Pass --waiver (or -w) to use waiver-wire replacement ranks instead of the
-default starter replacement ranks.
-
-  Starter replacement ranks : QB13, RB32, WR42, TE13, DST13
-  Waiver  replacement ranks : QB19, RB56, WR66, TE19, DST13
-    (waiver = first player NOT rostered on any of the 12 teams' bench)
+Runs both variants automatically:
+  Standard replacement ranks : QB13, RB32, WR42, TE13, DST13  (suffix: "")
+  Waiver   replacement ranks : QB19, RB56, WR66, TE19, DST13  (suffix: "_waiver")
 """
 
 from __future__ import annotations
 
-import argparse
 import sys
 from pathlib import Path
 import pandas as pd
@@ -203,64 +199,63 @@ if __name__ == "__main__":
     except ImportError:
         from visualize_par import visualize_and_export
 
-    parser = argparse.ArgumentParser(description="Aggregate PAR and compute auction values.")
-    parser.add_argument(
-        "--waiver", "-w",
-        action="store_true",
-        help="Use waiver-wire replacement ranks (starters + bench + 1) instead of starter-only ranks.",
-    )
-    args = parser.parse_args()
+    # Load data once; run both standard and waiver variants.
+    df_raw = load_and_clean_data(verbose=True)
 
-    if args.waiver:
-        replacement_ranks = REPLACEMENT_RANKS_WAIVER
-        starter_slots = STARTER_SLOTS_WAIVER
-        suffix = "_waiver"
-        print("=== Waiver-Wire Replacement Level Analysis ===")
-        print("\nReplacement-level ranks (starters + bench + 1):")
-        _starters = {"QB": 12, "RB": 31, "WR": 41, "TE": 12, "DST": 12}
-        _bench = {"QB": 6, "RB": 24, "WR": 24, "TE": 6, "DST": 0}
-        for pos in sorted(replacement_ranks):
-            s, b, r = _starters[pos], _bench[pos], replacement_ranks[pos]
-            print(f"  {pos}: {s} starters + {b} bench = {s + b} rostered  →  replacement = {pos}{r}")
-    else:
-        replacement_ranks = None  # use module-level defaults in calculate_par
-        starter_slots = None      # use module-level defaults in aggregate_par
-        suffix = ""
-        print("=== Standard Replacement Level Analysis ===")
+    _VARIANTS = [
+        {
+            "label": "Standard (starter-only replacement level)",
+            "replacement_ranks": None,   # use module-level REPLACEMENT_RANKS in calculate_par
+            "starter_slots": None,        # use module-level STARTER_SLOTS in aggregate_par
+            "suffix": "",
+        },
+        {
+            "label": "Waiver-wire replacement level",
+            "replacement_ranks": REPLACEMENT_RANKS_WAIVER,
+            "starter_slots": STARTER_SLOTS_WAIVER,
+            "suffix": "_waiver",
+        },
+    ]
 
-    df = load_and_clean_data(verbose=True)
-    df = calculate_par(df, replacement_ranks=replacement_ranks, verbose=True)
+    for variant in _VARIANTS:
+        print(f"\n{'='*60}")
+        print(f"=== {variant['label']} ===")
+        print(f"{'='*60}")
 
-    tier_summary_df, cross_position_ranking_df = aggregate_par(df, starter_slots=starter_slots)
+        df = calculate_par(df_raw, replacement_ranks=variant["replacement_ranks"], verbose=True)
+        tier_summary_df, cross_position_ranking_df = aggregate_par(df, starter_slots=variant["starter_slots"])
 
-    print("\n=== Tier Summary (starter slots only, sorted by position + rank) ===")
-    starter_tiers = (
-        tier_summary_df[tier_summary_df["is_starter"]]
-        .sort_values(["position", "positional_rank"])
-    )
-    print(
-        starter_tiers[
-            ["roster_slot", "mean_par", "median_par", "std_par", "min_par", "max_par", "seasons_observed", "auction_value"]
-        ]
-        .round(1)
-        .to_string(index=False)
-    )
+        print("\n=== Tier Summary (starter slots only, sorted by position + rank) ===")
+        starter_tiers = (
+            tier_summary_df[tier_summary_df["is_starter"]]
+            .sort_values(["position", "positional_rank"])
+        )
+        print(
+            starter_tiers[
+                ["roster_slot", "mean_par", "median_par", "std_par", "min_par", "max_par", "seasons_observed", "auction_value"]
+            ]
+            .round(1)
+            .to_string(index=False)
+        )
 
-    print("\n=== Cross-Position Ranking (all starter slots by auction value) ===")
-    print(
-        cross_position_ranking_df[
-            ["roster_slot", "mean_par", "median_par", "std_par", "seasons_observed", "auction_value"]
-        ]
-        .round(1)
-        .to_string(index=False)
-    )
+        print("\n=== Cross-Position Ranking (all starter slots by auction value) ===")
+        print(
+            cross_position_ranking_df[
+                ["roster_slot", "mean_par", "median_par", "std_par", "seasons_observed", "auction_value"]
+            ]
+            .round(1)
+            .to_string(index=False)
+        )
 
-    visualize_and_export(
-        tier_summary_df,
-        cross_position_ranking_df,
-        fantasy_df=df,
-        replacement_ranks=replacement_ranks,
-        suffix=suffix,
-    )
+        visualize_and_export(
+            tier_summary_df,
+            cross_position_ranking_df,
+            fantasy_df=df,
+            replacement_ranks=variant["replacement_ranks"],
+            suffix=variant["suffix"],
+        )
 
-    print(f"\nDone. Outputs saved{' with ' + repr(suffix) + ' suffix' if suffix else ''}.")
+        suffix_label = repr(variant["suffix"]) if variant["suffix"] else "no suffix"
+        print(f"\nDone. Outputs saved ({suffix_label}).")
+
+    print("\nAll variants complete.")

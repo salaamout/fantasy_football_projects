@@ -198,6 +198,70 @@ def plot_auction_value_top20(
     print(f"Saved: {out_path}")
 
 
+def plot_auction_value_curves(
+    cross_position_ranking_df: pd.DataFrame,
+    replacement_ranks: dict | None = None,
+    suffix: str = "",
+) -> None:
+    """
+    Chart 4 — Multi-line auction value curve by positional rank, overlaid for QB/RB/WR/TE.
+    Mirrors the PAR curves chart but plots auction_value vs positional_rank.
+    Saves to output/auction_value_curves{suffix}.png.
+    """
+    if replacement_ranks is None:
+        replacement_ranks = REPLACEMENT_RANKS
+
+    _ensure_output_dir()
+
+    positions_to_plot = [p for p in ["QB", "RB", "WR", "TE"] if p in POSITION_ORDER]
+
+    fig, ax = plt.subplots(figsize=(12, 7))
+
+    for position in positions_to_plot:
+        max_rank = replacement_ranks.get(position, 12)
+        pos_df = cross_position_ranking_df[
+            (cross_position_ranking_df["position"] == position)
+            & (cross_position_ranking_df["positional_rank"] <= max_rank)
+        ].sort_values("positional_rank")
+
+        if pos_df.empty:
+            print(f"WARNING: No auction value data for position {position}.")
+            continue
+
+        ax.plot(
+            pos_df["positional_rank"],
+            pos_df["auction_value"],
+            color=POSITION_COLORS[position],
+            marker="o",
+            markersize=4,
+            linewidth=2,
+            label=position,
+        )
+
+    ax.axhline(y=0, color="black", linestyle="--", linewidth=1, alpha=0.7, label="$0")
+
+    ax.set_title("Auction Value by Positional Rank (2020–2024, Half-PPR, 12-Team)", fontsize=14, fontweight="bold")
+    ax.set_xlabel("Positional Rank", fontsize=12)
+    ax.set_ylabel("Auction Value ($)", fontsize=12)
+    ax.legend(fontsize=11)
+    ax.grid(True, color="lightgray", alpha=0.3)
+
+    plt.tight_layout()
+    out_path = os.path.join(OUTPUT_DIR, f"auction_value_curves{suffix}.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+    positions_plotted = [
+        p for p in positions_to_plot
+        if not cross_position_ranking_df[
+            (cross_position_ranking_df["position"] == p)
+            & (cross_position_ranking_df["positional_rank"] <= replacement_ranks.get(p, 12))
+        ].empty
+    ]
+    print(f"Chart 4 validation — Positions plotted: {positions_plotted}")
+
+
 def plot_par_heatmap(tier_summary_df: pd.DataFrame, replacement_ranks: dict | None = None, suffix: str = "") -> None:
     """
     Chart 3 (optional) — Heatmap of mean PAR by position and rank bins.
@@ -288,6 +352,9 @@ def visualize_and_export(
 
     print("\n--- Chart 3: PAR heatmap ---")
     plot_par_heatmap(tier_summary_df, replacement_ranks=replacement_ranks, suffix=suffix)
+
+    print("\n--- Chart 4: Auction value curves by position ---")
+    plot_auction_value_curves(cross_position_ranking_df, replacement_ranks=replacement_ranks, suffix=suffix)
 
     print("\n--- Exporting CSVs ---")
     export_csv(tier_summary_df, cross_position_ranking_df, suffix=suffix)
