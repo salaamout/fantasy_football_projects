@@ -541,6 +541,90 @@ def plot_wtp_comparison(
     print(f"Saved: {out_path}")
 
 
+def plot_wtp_vs_espn(
+    wtp_df: pd.DataFrame,
+    suffix: str = "_historical",
+    source_label: str = "Hist avg",
+) -> None:
+    """
+    Scatter plot: WTP price (x-axis) vs. ESPN Estimated Auction Value (y-axis),
+    coloured by position, with a y=x reference line.
+
+    Points above the y=x line → ESPN overprices this slot relative to WTP.
+    Points below the y=x line → ESPN underprices this slot relative to WTP.
+
+    Saves to output/wtp_vs_espn_estimates{suffix}.png.
+    """
+    _ensure_output_dir()
+
+    STARTER_CUTOFFS_LOCAL = {"QB": 12, "RB": 31, "WR": 41, "TE": 12}
+    plot_df = wtp_df[
+        (wtp_df["positional_rank"] <= wtp_df["position"].map(STARTER_CUTOFFS_LOCAL))
+        & (wtp_df["espn_av"] > 0)
+    ].copy()
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # y = x reference line
+    axis_max = max(plot_df["wtp_price"].max(), plot_df["espn_av"].max()) * 1.08
+    ax.plot([0, axis_max], [0, axis_max], color="gray", linewidth=1.2, linestyle="--",
+            label="y = x  (WTP = ESPN AV)", zorder=1)
+
+    for pos in POSITION_ORDER:
+        sub = plot_df[plot_df["position"] == pos]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["wtp_price"],
+            sub["espn_av"],
+            color=POSITION_COLORS[pos],
+            label=pos,
+            s=60,
+            edgecolors="white",
+            linewidths=0.5,
+            zorder=3,
+        )
+        for _, row in sub.iterrows():
+            ax.annotate(
+                row["roster_slot"],
+                xy=(row["wtp_price"], row["espn_av"]),
+                xytext=(4, 2),
+                textcoords="offset points",
+                fontsize=7,
+                color=POSITION_COLORS[pos],
+            )
+
+    # Shade overpriced / underpriced regions
+    ax.fill_between(
+        [0, axis_max], [0, axis_max], axis_max,
+        alpha=0.04, color="red",
+        label="ESPN overprices (above line)",
+    )
+    ax.fill_between(
+        [0, axis_max], 0, [0, axis_max],
+        alpha=0.04, color="green",
+        label="ESPN underprices (below line)",
+    )
+
+    ax.set_xlim(0, axis_max)
+    ax.set_ylim(0, axis_max)
+    ax.set_xlabel(f"WTP Shadow Price ($)  [{source_label} points]", fontsize=11)
+    ax.set_ylabel("ESPN Estimated Auction Value ($)", fontsize=11)
+    ax.set_title(
+        f"WTP vs. ESPN Estimated Auction Value by Roster Slot\n({source_label} points, 12-Team, Half-PPR)",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.legend(fontsize=9, loc="upper left")
+    ax.grid(True, color="lightgray", alpha=0.3)
+
+    plt.tight_layout()
+    out_path = os.path.join(OUTPUT_DIR, f"wtp_vs_espn_estimates{suffix}.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
 def export_csv(tier_summary_df: pd.DataFrame, cross_position_ranking_df: pd.DataFrame, suffix: str = "") -> None:
     """Export tier summary and cross-position ranking to CSV files."""
     os.makedirs(DATA_DIR, exist_ok=True)
