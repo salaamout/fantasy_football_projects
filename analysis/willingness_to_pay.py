@@ -448,10 +448,10 @@ def solve_lp_relaxation(
             "Could not retrieve dual variable for budget constraint. "
             "Ensure you are using an LP (not MIP) solver."
         )
-    lambda_val = float(budget_dual)
-    if lambda_val <= 0:
+    lambda_lp = float(budget_dual)
+    if lambda_lp <= 0:
         raise RuntimeError(
-            f"Budget shadow price is {lambda_val:.4f} ≤ 0. "
+            f"Budget shadow price is {lambda_lp:.4f} ≤ 0. "
             "The budget constraint may not be binding — try increasing pool depth or reducing budget."
         )
 
@@ -475,7 +475,56 @@ def solve_lp_relaxation(
         "FLEX": float(prob.constraints["flex_slot"].pi or 0.0),
     }
 
-    return pool, lambda_val, slot_duals
+    # --- Calibrate λ to the competitive equilibrium rate ---
+    #
+    # The LP shadow price (λ_lp) is set by the FRACTIONAL BOUNDARY PLAYER —
+    # the most expensive-per-PAR player the LP is forced to include due to slot
+    # equality constraints.  When that player has a low par/price ratio (e.g.,
+    # an overpaid mid-tier RB), λ_lp is pulled below the true market exchange
+    # rate, inflating WTP for all other players by 30–50%.
+    #
+    # The correct equilibrium λ (λ_eq) comes from the market-clearing condition:
+    # at equilibrium, every drafted starter satisfies  par_i = λ × price_i + μ_pos.
+    # Summing over all N allocated starters:
+    #   Σ par_i  = λ_eq × Σ price_i  + Σ μ_pos_i
+    #   λ_eq = (Σ par_i − Σ μ_pos_i) / Σ price_i
+    #        = (total_LP_par − total_slot_dual_contrib) / total_starter_price
+    #
+    # This is the average points-per-dollar exchange rate across the full
+    # allocation (not just the marginal player), and it is what each team
+    # actually "pays" per PAR point in the competitive market.
+    n_pos_slots = {
+        "QB":   LINEUP_SLOTS["QB"]   * num_teams,
+        "RB":   LINEUP_SLOTS["RB"]   * num_teams,
+        "WR":   LINEUP_SLOTS["WR"]   * num_teams,
+        "TE":   LINEUP_SLOTS["TE"]   * num_teams,
+        "FLEX": LINEUP_SLOTS["FLEX"] * num_teams,
+    }
+    total_slot_dual_contrib = sum(slot_duals[pos] * n_pos_slots[pos] for pos in n_pos_slots)
+    total_par_starters = float(
+        (pool["par_points"]      * pool["lp_y"] +
+         pool["flex_par_points"] * pool["lp_z"]).sum()
+    )
+    total_price_starters = float(
+        (pool["price"] * (pool["lp_y"] + pool["lp_z"])).sum()
+    )
+
+    if total_price_starters <= 0:
+        raise RuntimeError("Total price of allocated starters is zero — LP allocation is degenerate.")
+
+    lambda_eq = (total_par_starters - total_slot_dual_contrib) / total_price_starters
+
+    if lambda_eq <= 0:
+        # Fall back to LP shadow price with a warning
+        import warnings
+        warnings.warn(
+            f"Calibrated equilibrium λ = {lambda_eq:.4f} ≤ 0; "
+            f"falling back to LP shadow price λ = {lambda_lp:.4f}.",
+            RuntimeWarning,
+        )
+        lambda_eq = lambda_lp
+
+    return pool, lambda_eq, slot_duals
 
 
 # ---------------------------------------------------------------------------
@@ -602,7 +651,7 @@ def build_wtp_table(
     pool_with_duals, lambda_val, slot_duals = solve_lp_relaxation(player_pool, budget=budget)
     if verbose:
         print(f"  LP status : Optimal")
-        print(f"  λ (shadow price of budget) = {lambda_val:.4f} pts/$")
+        print(f"  λ (equilibrium calibrated) = {lambda_val:.4f} pts/$")
         print(f"  Interpretation: each $1 of budget is worth {lambda_val:.2f} expected points")
         print(f"  Slot duals (μ): " + ", ".join(f"{k}={v:.2f}" for k, v in slot_duals.items()))
 
