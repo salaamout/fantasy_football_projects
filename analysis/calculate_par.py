@@ -122,6 +122,56 @@ def calculate_par(df: pd.DataFrame, replacement_ranks: dict | None = None, verbo
     return df
 
 
+def build_avg_points_lookup(
+    seasons=(2021, 2022, 2023, 2024, 2025),
+) -> tuple[dict, dict]:
+    """
+    Returns two dicts keyed by (position, positional_rank):
+      - avg_points[(position, positional_rank)] → mean raw half-PPR points across seasons
+      - avg_flex_points[(position, positional_rank)] → mean raw points when ranked within
+        the combined RB/WR/TE flex pool
+
+    Unlike build_avg_par_lookup, no replacement baseline is subtracted — these are
+    total projected points, not PAR.
+
+    Seasons window: 2021–2025 (2020 excluded — 16-game season).
+    """
+    FLEX_POSITIONS_LOCAL = {"RB", "WR", "TE"}
+
+    df = load_and_clean_data()
+    df = df[df["season"].isin(seasons)].copy()
+
+    # Positional rank within each (position, season)
+    df["pos_rank"] = (
+        df.groupby(["position", "season"])["half_ppr_points"]
+          .rank(method="first", ascending=False)
+          .astype(int)
+    )
+
+    avg_points = (
+        df.groupby(["position", "pos_rank"])["half_ppr_points"]
+          .mean()
+          .to_dict()
+    )
+
+    # Flex: combined rank across all RB/WR/TE within each season
+    flex_df = df[df["position"].isin(FLEX_POSITIONS_LOCAL)].copy()
+    flex_df["flex_rank"] = (
+        flex_df.groupby("season")["half_ppr_points"]
+               .rank(method="first", ascending=False)
+               .astype(int)
+    )
+
+    # Rebuild per-position positional rank (same as pos_rank above, already in flex_df)
+    avg_flex_points = (
+        flex_df.groupby(["position", "pos_rank"])["half_ppr_points"]
+               .mean()
+               .to_dict()
+    )
+
+    return avg_points, avg_flex_points
+
+
 if __name__ == "__main__":
     df = load_and_clean_data(verbose=True)
     df = calculate_par(df, verbose=True)

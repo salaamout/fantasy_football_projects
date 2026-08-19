@@ -314,6 +314,233 @@ def plot_par_heatmap(tier_summary_df: pd.DataFrame, replacement_ranks: dict | No
     print(f"Saved: {out_path}")
 
 
+def plot_cross_source_comparison(results_dict: dict) -> None:
+    """
+    Bar chart comparing projected lineup points across the 4 cross-source combos.
+    Bars are annotated with total auction cost.
+    Saves to output/cross_source_comparison.png.
+    """
+    _ensure_output_dir()
+
+    labels  = [v["label"]        for v in results_dict.values()]
+    points  = [v["total_points"] for v in results_dict.values()]
+    costs   = [v["total_cost"]   for v in results_dict.values()]
+
+    x = range(len(labels))
+    colors = ["#0072B2", "#E69F00", "#009E73", "#D55E00"]
+
+    fig, ax = plt.subplots(figsize=(10, 6))
+    bars = ax.bar(x, points, color=colors[: len(labels)], edgecolor="white", width=0.5)
+
+    for bar, cost, pts in zip(bars, costs, points):
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + 5,
+            f"${cost}",
+            ha="center", va="bottom", fontsize=11, fontweight="bold",
+        )
+        ax.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() / 2,
+            f"{pts:.1f} pts",
+            ha="center", va="center", fontsize=10, color="white", fontweight="bold",
+        )
+
+    ax.set_xticks(list(x))
+    ax.set_xticklabels(labels, fontsize=12)
+    ax.set_ylabel("Projected Lineup Points (incl. 119-pt DST)", fontsize=11)
+    ax.set_title(
+        "Cross-Source Optimizer: Projected Points by Rank × Price Combo",
+        fontsize=13, fontweight="bold",
+    )
+    ax.grid(True, axis="y", color="lightgray", alpha=0.4)
+    ax.set_ylim(0, max(points) * 1.12)
+
+    plt.tight_layout()
+    out_path = os.path.join(OUTPUT_DIR, "cross_source_comparison.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def plot_wtp_top20(
+    wtp_df: pd.DataFrame,
+    suffix: str = "_historical",
+    source_label: str = "Hist avg",
+) -> None:
+    """
+    Horizontal bar chart of the top-20 roster slots by WTP price.
+    Mirrors the style of plot_auction_value_top20.
+
+    Bars are split into:
+      - solid fill  : WTP price (what you should be willing to pay)
+      - hatched overlay : Method 1 auction value (for comparison)
+
+    Saves to output/wtp_top20{suffix}.png.
+    """
+    _ensure_output_dir()
+
+    # Restrict to starter range
+    STARTER_CUTOFFS_LOCAL = {"QB": 12, "RB": 31, "WR": 41, "TE": 12}
+    starters = wtp_df[
+        wtp_df["positional_rank"] <= wtp_df["position"].map(STARTER_CUTOFFS_LOCAL)
+    ].copy()
+    top20 = starters.nlargest(20, "wtp_price").iloc[::-1].reset_index(drop=True)
+
+    colors = [POSITION_COLORS.get(pos, "gray") for pos in top20["position"]]
+
+    fig, ax = plt.subplots(figsize=(14, 8))
+
+    bars_wtp = ax.barh(
+        top20["roster_slot"],
+        top20["wtp_price"],
+        color=colors,
+        edgecolor="white",
+        height=0.7,
+        label="WTP (shadow price)",
+    )
+    # Method 1 AV as a thin outline bar behind
+    ax.barh(
+        top20["roster_slot"],
+        top20["method1_av"],
+        color="none",
+        edgecolor="black",
+        linewidth=1.2,
+        height=0.7,
+        linestyle="--",
+        label="Method 1 Auction Value",
+    )
+
+    for bar, (_, row) in zip(bars_wtp, top20.iterrows()):
+        bar_width  = bar.get_width()
+        bar_mid_y  = bar.get_y() + bar.get_height() / 2
+        ax.text(
+            bar_width + 0.5, bar_mid_y,
+            f"${row['wtp_price']:.0f}",
+            va="center", ha="left", fontsize=9,
+        )
+        pts_str = f"{row['expected_points']:.0f} pts"
+        ax.text(
+            bar_width * 0.97, bar_mid_y,
+            pts_str,
+            va="center", ha="right",
+            fontsize=8, color="white", fontweight="bold",
+            clip_on=True,
+        )
+
+    legend_patches = [
+        mpatches.Patch(color=POSITION_COLORS[pos], label=pos)
+        for pos in POSITION_ORDER
+        if pos in top20["position"].values
+    ]
+    from matplotlib.lines import Line2D
+    legend_patches.append(
+        Line2D([0], [0], color="black", linewidth=1.2, linestyle="--", label="Method 1 AV")
+    )
+    ax.legend(handles=legend_patches, fontsize=9, loc="lower right")
+
+    ax.set_title(
+        f"Top 20 Roster Slots by Willingness-to-Pay ({source_label} points, 12-Team, Half-PPR)",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.set_xlabel("Willingness to Pay ($)", fontsize=11)
+    ax.set_ylabel("Roster Slot", fontsize=11)
+    ax.grid(True, axis="x", color="lightgray", alpha=0.3)
+    ax.set_xlim(0, max(top20["wtp_price"].max(), top20["method1_av"].max()) * 1.18)
+
+    plt.tight_layout()
+    out_path = os.path.join(OUTPUT_DIR, f"wtp_top20{suffix}.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def plot_wtp_comparison(
+    wtp_df: pd.DataFrame,
+    suffix: str = "_historical",
+    source_label: str = "Hist avg",
+) -> None:
+    """
+    Scatter plot: WTP price (x-axis) vs. Method 1 Auction Value (y-axis),
+    coloured by position, with a y=x reference line.
+
+    Points above the y=x line → Method 1 overprices this slot relative to WTP.
+    Points below the y=x line → Method 1 underprices this slot relative to WTP.
+
+    Saves to output/wtp_vs_method1{suffix}.png.
+    """
+    _ensure_output_dir()
+
+    STARTER_CUTOFFS_LOCAL = {"QB": 12, "RB": 31, "WR": 41, "TE": 12}
+    plot_df = wtp_df[
+        (wtp_df["positional_rank"] <= wtp_df["position"].map(STARTER_CUTOFFS_LOCAL))
+        & (wtp_df["method1_av"] > 0)
+    ].copy()
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    # y = x reference line
+    axis_max = max(plot_df["wtp_price"].max(), plot_df["method1_av"].max()) * 1.08
+    ax.plot([0, axis_max], [0, axis_max], color="gray", linewidth=1.2, linestyle="--",
+            label="y = x  (WTP = Method 1 AV)", zorder=1)
+
+    for pos in POSITION_ORDER:
+        sub = plot_df[plot_df["position"] == pos]
+        if sub.empty:
+            continue
+        ax.scatter(
+            sub["wtp_price"],
+            sub["method1_av"],
+            color=POSITION_COLORS[pos],
+            label=pos,
+            s=60,
+            edgecolors="white",
+            linewidths=0.5,
+            zorder=3,
+        )
+        # Annotate each point with its roster_slot label
+        for _, row in sub.iterrows():
+            ax.annotate(
+                row["roster_slot"],
+                xy=(row["wtp_price"], row["method1_av"]),
+                xytext=(4, 2),
+                textcoords="offset points",
+                fontsize=7,
+                color=POSITION_COLORS[pos],
+            )
+
+    # Shade overpriced / underpriced regions
+    ax.fill_between(
+        [0, axis_max], [0, axis_max], axis_max,
+        alpha=0.04, color="red",
+        label="Method 1 overprices (above line)",
+    )
+    ax.fill_between(
+        [0, axis_max], 0, [0, axis_max],
+        alpha=0.04, color="green",
+        label="Method 1 underprices (below line)",
+    )
+
+    ax.set_xlim(0, axis_max)
+    ax.set_ylim(0, axis_max)
+    ax.set_xlabel(f"WTP Shadow Price ($)  [{source_label} points]", fontsize=11)
+    ax.set_ylabel("Method 1 Auction Value ($)", fontsize=11)
+    ax.set_title(
+        f"WTP vs. Method 1 Auction Value by Roster Slot\n({source_label} points, 12-Team, Half-PPR)",
+        fontsize=13,
+        fontweight="bold",
+    )
+    ax.legend(fontsize=9, loc="upper left")
+    ax.grid(True, color="lightgray", alpha=0.3)
+
+    plt.tight_layout()
+    out_path = os.path.join(OUTPUT_DIR, f"wtp_vs_method1{suffix}.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
 def export_csv(tier_summary_df: pd.DataFrame, cross_position_ranking_df: pd.DataFrame, suffix: str = "") -> None:
     """Export tier summary and cross-position ranking to CSV files."""
     os.makedirs(DATA_DIR, exist_ok=True)

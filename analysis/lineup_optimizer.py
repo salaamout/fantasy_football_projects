@@ -22,11 +22,11 @@ import pulp
 # Allow imports from the analysis directory when run directly
 try:
     from .load_fantasy_data import load_and_clean_data
-    from .calculate_par import calculate_par, REPLACEMENT_RANKS
+    from .calculate_par import calculate_par, REPLACEMENT_RANKS, build_avg_points_lookup
 except ImportError:
     sys.path.insert(0, str(Path(__file__).parent))
     from load_fantasy_data import load_and_clean_data
-    from calculate_par import calculate_par, REPLACEMENT_RANKS
+    from calculate_par import calculate_par, REPLACEMENT_RANKS, build_avg_points_lookup
 
 RANKINGS_PATH = Path(__file__).parent.parent / "data" / "ringer_2026_rankings.csv"
 BUDGET        = 200
@@ -233,6 +233,7 @@ def optimize_lineup(rankings: pd.DataFrame) -> pd.DataFrame:
 
 
 ESPN_DATA_PATH   = Path(__file__).parent.parent / "data" / "espn_projected_values.csv"
+RINGER_DATA_PATH = Path(__file__).parent.parent / "data" / "ringer_2026_rankings.csv"
 ESPN_OUTPUT_PATH = Path(__file__).parent.parent / "output" / "espn_optimized_roster.csv"
 ESPN_LINEUP_SLOTS  = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "FLEX": 1}
 ESPN_BENCH_SLOTS   = 4
@@ -363,8 +364,435 @@ def optimize_espn_lineup(players_df: pd.DataFrame, budget: int = 200) -> pd.Data
     return result
 
 
+
+# ---------------------------------------------------------------------------
+# Cross-source optimizer (Goal 8)
+# ---------------------------------------------------------------------------
+
+DST_PLACEHOLDER_POINTS = 7 * 17  # 119 pts (7 pts/game × 17 games)
+CROSS_SOURCE_SKILL_POSITIONS = {"QB", "RB", "WR", "TE"}
+CROSS_BENCH_SLOTS = 4  # bench spots (no QB/TE; ≤3 RB, ≤2 WR)
+
+
+def _abbrev_name(name: str) -> str:
+    """Return 'F. Lastname' abbreviation for a player name."""
+    parts = name.strip().split()
+    if len(parts) >= 2:
+        return f"{parts[0][0]}. {' '.join(parts[1:])}"
+    return name
+
+
+def build_combo_rankings(rank_source: str, price_source: str) -> pd.DataFrame:
+    """
+    Build a combined rankings DataFrame for one of the 4 cross-source combos.
+
+    rank_source  ∈ {"espn", "ringer"}  — determines positional_rank
+    price_source ∈ {"espn", "ringer"}  — determines auction_value
+
+    When the two sources differ, player names are fuzzy-matched with rapidfuzz
+    (score cutoff 85). Unmatched players are dropped with a log message.
+
+    Returns DataFrame with columns:
+        player_name, position, positional_rank, auction_value
+    """
+    try:
+        from rapidfuzz import process as rf_process, fuzz as rf_fuzz
+        _HAS_RAPIDFUZZ = True
+    except ImportError:
+        _HAS_RAPIDFUZZ = False
+
+    # Load rank source
+    if rank_source == "espn":
+        rank_df = pd.read_csv(ESPN_DATA_PATH)
+    else:
+        rank_df = pd.read_csv(RINGER_DATA_PATH)
+    rank_df = rank_df[rank_df["position"].isin(CROSS_SOURCE_SKILL_POSITIONS)].copy()
+
+    # Load price source
+    if price_source == "espn":
+        price_df = pd.read_csv(ESPN_DATA_PATH)
+    else:
+        price_df = pd.read_csv(RINGER_DATA_PATH)
+    price_df = price_df[price_df["position"].isin(CROSS_SOURCE_SKILL_POSITIONS)].copy()
+
+    if rank_source == price_source:
+        # Same source — direct merge; columns already consistent
+        result = rank_df[["player_name", "position", "positional_rank"]].copy()
+        result = result.merge(
+            price_df[["player_name", "auction_value"]],
+            on="player_name",
+            how="inner",
+        )
+        return result.reset_index(drop=True)
+
+    # Different sources — fuzzy name matching
+    if not _HAS_RAPIDFUZZ:
+        raise ImportError(
+            "rapidfuzz is required for cross-source name matching. "
+            "Install with: pip install rapidfuzz"
+        )
+
+    price_names = price_df["player_name"].tolist()
+    matched_rows = []
+    unmatched = []
+
+    for _, row in rank_df.iterrows():
+        match = rf_process.extractOne(
+            row["player_name"],
+            price_names,
+            scorer=rf_fuzz.token_sort_ratio,
+            score_cutoff=85,
+        )
+        if match is None:
+            unmatched.append(row["player_name"])
+            continue
+        matched_name = match[0]
+        price_row = price_df[price_df["player_name"] == matched_name].iloc[0]
+        matched_rows.append({
+            "player_name": row["player_name"],
+            "position": row["position"],
+            "positional_rank": row["positional_rank"],
+            "auction_value": price_row["auction_value"],
+        })
+
+    if unmatched:
+        print(
+            f"  [build_combo_rankings rank={rank_source} price={price_source}] "
+            f"Dropped {len(unmatched)} unmatched players: {unmatched[:10]}"
+            + (" ..." if len(unmatched) > 10 else "")
+        )
+
+    return pd.DataFrame(matched_rows).reset_index(drop=True)
+
+
+def attach_expected_points(
+    rankings: pd.DataFrame,
+    avg_points: dict,
+    avg_flex_points: dict,
+    rank_window: int = 0,
+) -> pd.DataFrame:
+    """
+    Attach two expected-points columns to rankings:
+      expected_points      — value when filling a dedicated positional slot
+      flex_expected_points — value when filling the FLEX slot (RB/WR/TE only)
+
+    Falls back to the minimum historical value for the position when rank exceeds
+    the lookup table. rank_window mirrors the smoothing in attach_expected_par.
+    """
+    def _min_per_pos(lookup):
+        mins: dict = {}
+        for (pos, _r), val in lookup.items():
+            mins[pos] = min(mins.get(pos, val), val)
+        return mins
+
+    min_pos  = _min_per_pos(avg_points)
+    min_flex = _min_per_pos(avg_flex_points)
+
+    def _avg_lookup(lookup, pos, rank, fallback):
+        if rank_window == 0:
+            return lookup.get((pos, rank), fallback)
+        lo = max(1, rank - rank_window)
+        hi = rank + rank_window
+        vals = [lookup[(pos, r)] for r in range(lo, hi + 1) if (pos, r) in lookup]
+        return sum(vals) / len(vals) if vals else fallback
+
+    rankings = rankings.copy()
+
+    rankings["expected_points"] = rankings.apply(
+        lambda r: _avg_lookup(
+            avg_points, r["position"], r["positional_rank"],
+            min_pos.get(r["position"], 0.0),
+        ),
+        axis=1,
+    )
+
+    rankings["flex_expected_points"] = rankings.apply(
+        lambda r: _avg_lookup(
+            avg_flex_points, r["position"], r["positional_rank"],
+            min_flex.get(r["position"], 0.0),
+        ) if r["position"] in FLEX_POSITIONS else 0.0,
+        axis=1,
+    )
+
+    return rankings
+
+
+def optimize_lineup_points(rankings: pd.DataFrame, budget: int = 200) -> pd.DataFrame:
+    """
+    Three-variable MILP formulation maximising historical average points:
+      y[i] = 1 if player fills a dedicated positional slot
+      z[i] = 1 if player fills the FLEX slot   (RB/WR/TE only)
+      b[i] = 1 if player fills a bench slot     (no QB/TE; ≤3 RB, ≤2 WR)
+      y[i] + z[i] + b[i] <= 1
+
+    Objective: max Σ expected_points[i]*y[i] + Σ flex_expected_points[i]*z[i]
+    (bench players are selected within budget but not counted toward objective)
+
+    DST placeholder (119 pts) is NOT included in the MILP — caller adds it.
+    """
+    prob = pulp.LpProblem("lineup_points_optimizer", pulp.LpMaximize)
+
+    players = rankings.to_dict("records")
+    n = len(players)
+
+    y = [pulp.LpVariable(f"yp_{i}", cat="Binary") for i in range(n)]
+    z = [pulp.LpVariable(f"zp_{i}", cat="Binary") for i in range(n)]
+    b = [pulp.LpVariable(f"bp_{i}", cat="Binary") for i in range(n)]
+
+    # FLEX only for RB/WR/TE
+    for i, p in enumerate(players):
+        if p["position"] not in FLEX_POSITIONS:
+            prob += z[i] == 0
+
+    # Each player fills at most one slot
+    for i in range(n):
+        prob += y[i] + z[i] + b[i] <= 1
+
+    # Objective: starter points only (bench not counted)
+    prob += pulp.lpSum(
+        p["expected_points"]      * y[i] +
+        p["flex_expected_points"] * z[i]
+        for i, p in enumerate(players)
+    )
+
+    # Budget includes bench cost
+    prob += pulp.lpSum(
+        p["auction_value"] * (y[i] + z[i] + b[i])
+        for i, p in enumerate(players)
+    ) <= budget
+
+    # Starter slot counts
+    prob += pulp.lpSum(y[i] for i, p in enumerate(players) if p["position"] == "QB") == LINEUP_SLOTS["QB"]
+    for pos in ("RB", "WR", "TE"):
+        prob += pulp.lpSum(
+            y[i] for i, p in enumerate(players) if p["position"] == pos
+        ) == LINEUP_SLOTS[pos]
+
+    # Exactly one FLEX slot
+    prob += pulp.lpSum(z) == LINEUP_SLOTS["FLEX"]
+
+    # Exactly CROSS_BENCH_SLOTS bench players
+    prob += pulp.lpSum(b) == CROSS_BENCH_SLOTS
+
+    # Bench composition: no QB/TE; ≤3 RB, ≤2 WR
+    for i, p in enumerate(players):
+        if p["position"] in ("QB", "TE"):
+            prob += b[i] == 0
+    prob += pulp.lpSum(b[i] for i, p in enumerate(players) if p["position"] == "RB") <= 3
+    prob += pulp.lpSum(b[i] for i, p in enumerate(players) if p["position"] == "WR") <= 2
+
+    status = prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    if pulp.LpStatus[status] != "Optimal":
+        raise RuntimeError(f"No optimal solution found. Status: {pulp.LpStatus[status]}")
+
+    rows = []
+    for i, p in enumerate(players):
+        if pulp.value(y[i]) == 1:
+            rows.append({**p, "slot": p["position"]})
+        elif pulp.value(z[i]) == 1:
+            rows.append({**p, "slot": "FLEX"})
+        elif pulp.value(b[i]) == 1:
+            rows.append({**p, "slot": "Bench"})
+
+    slot_order = {"QB": 0, "RB": 1, "WR": 2, "TE": 3, "FLEX": 4, "Bench": 5}
+    result = pd.DataFrame(rows)
+    result["_slot_order"] = result["slot"].map(slot_order)
+    result = result.sort_values(["_slot_order", "positional_rank"]).drop(columns=["_slot_order"])
+    return result.reset_index(drop=True)
+
+
+def run_cross_source_optimization(budget: int = 200) -> dict:
+    """
+    Run all 4 cross-source optimizer combinations and return a results dict.
+
+    Combinations:
+      A: rank=ESPN,   price=ESPN
+      B: rank=ESPN,   price=Ringer
+      C: rank=Ringer, price=ESPN
+      D: rank=Ringer, price=Ringer
+
+    Each result dict entry contains:
+      'lineup'        — optimized DataFrame
+      'total_points'  — projected lineup points incl. DST placeholder (119 pts)
+      'total_cost'    — total auction spend
+      'label'         — combo label string
+
+    Also saves output CSVs and a comparison bar chart.
+    """
+    try:
+        from .visualize_par import plot_cross_source_comparison
+    except ImportError:
+        sys.path.insert(0, str(Path(__file__).parent))
+        from visualize_par import plot_cross_source_comparison
+
+    OUTPUT_DIR = Path(__file__).parent.parent / "output"
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    print("Building historical average points lookup (2021–2025)…")
+    avg_points, avg_flex_points = build_avg_points_lookup()
+
+    combos = [
+        ("A", "espn",   "espn",   "ESPN/ESPN"),
+        ("B", "espn",   "ringer", "ESPN/Ringer"),
+        ("C", "ringer", "espn",   "Ringer/ESPN"),
+        ("D", "ringer", "ringer", "Ringer/Ringer"),
+    ]
+
+    results = {}
+    for combo_id, rank_src, price_src, label in combos:
+        print(f"\n--- Combo {combo_id}: rank={rank_src.upper()}, price={price_src.upper()} ---")
+        try:
+            rankings = build_combo_rankings(rank_src, price_src)
+            rankings = attach_expected_points(rankings, avg_points, avg_flex_points)
+            # Enforce $1 minimum bid; reserve $1 for DST
+            rankings["auction_value"] = rankings["auction_value"].clip(lower=1)
+            skill_budget = budget - 1  # $1 reserved for DST
+            lineup   = optimize_lineup_points(rankings, budget=skill_budget)
+
+            lineup["slot_points"] = lineup.apply(
+                lambda r: r["flex_expected_points"] if r["slot"] == "FLEX" else r["expected_points"],
+                axis=1,
+            )
+            skill_pts   = lineup["slot_points"].sum()
+            total_pts   = skill_pts + DST_PLACEHOLDER_POINTS
+            total_cost  = lineup["auction_value"].sum() + 1  # +$1 for DST
+
+            results[combo_id] = {
+                "label":        label,
+                "lineup":       lineup,
+                "total_points": total_pts,
+                "skill_points": skill_pts,
+                "total_cost":   total_cost,
+            }
+
+            # Save CSV
+            csv_path = OUTPUT_DIR / f"cross_source_{combo_id.lower()}.csv"
+            lineup.to_csv(csv_path, index=False)
+            print(f"  Saved: {csv_path}")
+            print(f"  Total projected points (incl. DST): {total_pts:.1f}  |  Cost: ${total_cost}")
+
+        except Exception as e:
+            print(f"  ERROR in combo {combo_id}: {e}")
+
+    # Print one table per combo, then a summary
+    SLOT_DISPLAY_ORDER = [
+        ("QB",    "QB"),
+        ("RB",    "RB"),
+        ("RB",    "RB"),
+        ("WR",    "WR"),
+        ("WR",    "WR"),
+        ("WR",    "WR"),
+        ("TE",    "TE"),
+        ("FLEX",  "FLEX"),
+        ("Bench", "Bench"),
+        ("Bench", "Bench"),
+        ("Bench", "Bench"),
+        ("Bench", "Bench"),
+    ]
+
+    COL_WIDTH_NAME = 24
+    COL_WIDTH_NUM  = 10
+
+    def _combo_table_rows(lineup: pd.DataFrame) -> list[dict]:
+        """Return one display-row dict per lineup slot in display order."""
+        starters  = lineup[lineup["slot"] != "Bench"].copy()
+        bench_df  = lineup[lineup["slot"] == "Bench"].sort_values("positional_rank").reset_index(drop=True)
+        slot_counts: dict[str, int] = {}
+        bench_idx = 0
+        rows_out = []
+        for slot_key, _pos_label in SLOT_DISPLAY_ORDER:
+            if slot_key == "Bench":
+                if bench_idx < len(bench_df):
+                    p = bench_df.iloc[bench_idx]
+                    pts = p["expected_points"]
+                    rows_out.append({
+                        "slot":   f"Bench {bench_idx + 1}",
+                        "pos":    p["position"],
+                        "name":   p["player_name"],
+                        "cost":   int(p["auction_value"]),
+                        "points": pts,
+                    })
+                    bench_idx += 1
+                else:
+                    rows_out.append({"slot": f"Bench {bench_idx + 1}", "pos": "—", "name": "—", "cost": 0, "points": 0.0})
+                    bench_idx += 1
+            else:
+                nth = slot_counts.get(slot_key, 0) + 1
+                slot_counts[slot_key] = nth
+                matching = starters[starters["slot"] == slot_key].sort_values("positional_rank")
+                if len(matching) >= nth:
+                    p = matching.iloc[nth - 1]
+                    pts = p["flex_expected_points"] if slot_key == "FLEX" else p["expected_points"]
+                    label = slot_key if nth == 1 else f"{slot_key}{nth}"
+                    rows_out.append({
+                        "slot":   label,
+                        "pos":    p["position"],
+                        "name":   p["player_name"],
+                        "cost":   int(p["auction_value"]),
+                        "points": pts,
+                    })
+                else:
+                    rows_out.append({"slot": slot_key, "pos": "—", "name": "—", "cost": 0, "points": 0.0})
+        return rows_out
+
+    print("\n=== Cross-Source Optimization Results ===")
+    for combo_id, *_ in combos:
+        if combo_id not in results:
+            continue
+        r = results[combo_id]
+        table_rows = _combo_table_rows(r["lineup"])
+
+        header_line = (
+            f"  {'Slot':<8}  {'Pos':<6}  {'Player':<{COL_WIDTH_NAME}}  "
+            f"{'Cost':>{COL_WIDTH_NUM}}  {'Proj Pts':>{COL_WIDTH_NUM}}"
+        )
+        separator = "  " + "-" * (len(header_line) - 2)
+
+        print(f"\n--- Combo {combo_id}: {r['label']} ---")
+        print(header_line)
+        print(separator)
+        for tr in table_rows:
+            cost_str = f"${tr['cost']}" if tr["cost"] else "—"
+            pts_str  = f"{tr['points']:.1f}" if tr["points"] else "—"
+            print(
+                f"  {tr['slot']:<8}  {tr['pos']:<6}  {tr['name']:<{COL_WIDTH_NAME}}  "
+                f"{cost_str:>{COL_WIDTH_NUM}}  {pts_str:>{COL_WIDTH_NUM}}"
+            )
+        print(separator)
+        skill_cost = sum(tr["cost"] for tr in table_rows if "Bench" not in tr["slot"])
+        print(
+            f"  {'TOTAL':<8}  {'':6}  {'(+ $1 DST)':<{COL_WIDTH_NAME}}  "
+            f"${r['total_cost']:>{COL_WIDTH_NUM - 1}}  {r['total_points']:>{COL_WIDTH_NUM}.1f}"
+        )
+
+    # Summary across all combos
+    print("\n=== Summary ===")
+    sum_header = f"  {'Combo':<20}  {'Proj Pts':>10}  {'Cost':>6}"
+    print(sum_header)
+    print("  " + "-" * (len(sum_header) - 2))
+    for combo_id, *_ in combos:
+        if combo_id not in results:
+            continue
+        r = results[combo_id]
+        combo_label = f"Combo {combo_id}: {r['label']}"
+        print(f"  {combo_label:<20}  {r['total_points']:>10.1f}  ${r['total_cost']:>5}")
+
+    # Bar chart
+    plot_cross_source_comparison(results)
+
+    return results
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Fantasy football lineup optimizer.")
+    parser.add_argument(
+        "--cross",
+        action="store_true",
+        help=(
+            "Run the cross-source optimizer (Goal 8). "
+            "Runs all 4 rank × price combos and saves output CSVs and comparison chart."
+        ),
+    )
     parser.add_argument(
         "--espn",
         action="store_true",
@@ -414,6 +842,11 @@ if __name__ == "__main__":
         ),
     )
     args = parser.parse_args()
+
+    # -------------------------------------------------------------- Cross --
+    if args.cross:
+        run_cross_source_optimization(budget=args.budget)
+        sys.exit(0)
 
     # ------------------------------------------------------------------ ESPN --
     if args.espn:
