@@ -1,0 +1,9 @@
+- Look at QB thing: are QBs inherently less predictable and therefore paying more for a top projected qb is a bad idea?
+- Try a mock draft with the willingness to pay table (CHECK)
+- There doesn't need to be one price! Experiment with multiple
+- App to auto-update prices as we go
+- Use multiple predicted points sources (fantasypros? yahoo? sleeper? history?)
+- Goal isn't to get the highest predicted points, it's to maximize my odds of winning as many of the first 11 games as possible
+  - Model uncertainty (particularly upside, think in terms of RB1 upside or whatever)
+  - Model strength of schedule (ESPN has a per week prediction already I believe, use that to give each player a boost or drop for the first 11 weeks)
+  - Model 
