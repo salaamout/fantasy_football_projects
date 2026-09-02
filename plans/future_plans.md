@@ -5,7 +5,6 @@
 - Look at QB thing: are QBs inherently less predictable and therefore paying more for a top projected qb is a bad idea?
 - Try a mock draft with the willingness to pay table (CHECK)
 - There doesn't need to be one price! Experiment with multiple
-- App to auto-update prices as we go
 - Use multiple predicted points sources (fantasypros? yahoo? sleeper? history?) (CHECK — blended ESPN+Sleeper+historical source added, see Goal 10)
 - Open questions from Goal 10 (blended projections) to revisit:
   - Current blend weighting is a simple/uniform average across sources — should weights be tuned (e.g. weight ESPN or Sleeper higher for skill positions with more betting-market signal)?
