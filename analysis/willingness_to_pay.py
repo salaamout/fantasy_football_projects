@@ -84,11 +84,13 @@ SOURCE_LABELS = {
     "historical": "historical avg (2021–2025)",
     "espn":       "ESPN 2026 projected",
     "blended":    "Blended (ESPN + Sleeper + historical)",
+    "blended_sched": "Blended, schedule-adjusted (weeks 1–11)",
 }
 SOURCE_SUFFIXES = {
     "historical": "_historical",
     "espn":       "_espn",
     "blended":    "_blended",
+    "blended_sched": "_blended_sched",
 }
 
 SKILL_BUDGET          = 199          # $200 − $1 for DST (single-team budget)
@@ -200,7 +202,7 @@ def _build_espn_points_table() -> pd.DataFrame:
     return df_out
 
 
-def _build_blended_points_table() -> pd.DataFrame:
+def _build_blended_points_table(schedule_adjust: bool = False) -> pd.DataFrame:
     """
     Return a tidy DataFrame of blended (ESPN + Sleeper + historical) projected
     points indexed by (position, positional_rank), mirroring the schema used
@@ -213,6 +215,14 @@ def _build_blended_points_table() -> pd.DataFrame:
     can join to ESPN's salary-cap data by name — the blended source's own
     positional_rank does not line up with ESPN's positional_rank, since it's
     re-ranked by the blended point value.
+
+    Goal 13, Step 4: if `schedule_adjust` is True, points are re-ranked by
+    `schedule_adjusted_points` (weeks 1–11 strength-of-schedule-adjusted
+    per-player total, see `analysis/schedule_adjustment.py`) instead of the
+    raw blended `projected_points`. `expected_points`/`par_points` etc. are
+    then computed off this adjusted value, so positional ranks — and
+    therefore the whole downstream WTP pricing — shift to reflect each
+    player's specific early-season schedule difficulty.
     """
     if not BLENDED_DATA_PATH.exists():
         raise FileNotFoundError(
@@ -223,14 +233,30 @@ def _build_blended_points_table() -> pd.DataFrame:
     blended = pd.read_csv(BLENDED_DATA_PATH)
     blended = blended[blended["position"].isin(SKILL_POSITIONS)].copy()
     blended = blended.dropna(subset=["projected_points", "positional_rank"])
-    blended["positional_rank"] = blended["positional_rank"].astype(int)
-    blended = blended.sort_values(["position", "positional_rank"]).reset_index(drop=True)
+
+    points_col = "projected_points"
+    if schedule_adjust:
+        try:
+            from .schedule_adjustment import compute_schedule_adjusted_points
+        except ImportError:
+            sys.path.insert(0, str(_HERE))
+            from schedule_adjustment import compute_schedule_adjusted_points
+
+        blended = compute_schedule_adjusted_points(blended)
+        points_col = "schedule_adjusted_points"
+
+    # Re-rank per position by the chosen points column (positional_rank from
+    # the source CSV no longer applies once we're using a schedule-adjusted
+    # value, since players can move up/down based on early-season matchups).
+    blended = blended.sort_values(["position", points_col], ascending=[True, False])
+    blended["positional_rank"] = blended.groupby("position").cumcount() + 1
+    blended = blended.reset_index(drop=True)
 
     rows = []
     for _, row in blended.iterrows():
         pos  = row["position"]
         rank = int(row["positional_rank"])
-        ep   = float(row["projected_points"])
+        ep   = float(row[points_col])
         fep  = ep if pos in FLEX_POSITIONS else 0.0
         rows.append({
             "position":             pos,
@@ -258,25 +284,35 @@ def _build_blended_points_table() -> pd.DataFrame:
     return df_out
 
 
-def build_points_table(point_source: str = "historical") -> pd.DataFrame:
+def build_points_table(point_source: str = "historical", schedule_adjust: bool = False) -> pd.DataFrame:
     """
     Build the expected-points table for the LP.
 
     Parameters
     ----------
     point_source : "historical" (default), "espn", or "blended"
+    schedule_adjust : if True (only valid when point_source == "blended"),
+        rank/price players off `schedule_adjusted_points` (weeks 1–11
+        strength-of-schedule adjusted, see `analysis/schedule_adjustment.py`)
+        instead of the raw blended `projected_points`.
 
     Returns
     -------
     DataFrame with columns:
         position, positional_rank, expected_points, flex_expected_points
     """
+    if schedule_adjust and point_source != "blended":
+        raise ValueError(
+            "schedule_adjust=True is only valid with point_source='blended' "
+            "(historical/ESPN tables are position-rank aggregates with no "
+            "per-player identity to attach a schedule to)."
+        )
     if point_source == "espn":
         return _build_espn_points_table()
     elif point_source == "historical":
         return _build_historical_points_table()
     elif point_source == "blended":
-        return _build_blended_points_table()
+        return _build_blended_points_table(schedule_adjust=schedule_adjust)
     else:
         raise ValueError(
             f"Unknown point_source: {point_source!r}. Choose 'historical', 'espn', or 'blended'."
@@ -683,10 +719,23 @@ def compute_wtp(
 # Main orchestrator
 # ---------------------------------------------------------------------------
 
+def _effective_source_key(point_source: str, schedule_adjust: bool = False) -> str:
+    """
+    Resolve the SOURCE_LABELS/SOURCE_SUFFIXES key to use, accounting for the
+    Goal 13 `--schedule-adjust` flag (only meaningful with point_source ==
+    "blended"): produces "blended_sched" so schedule-adjusted runs write to
+    parallel output files instead of clobbering the unadjusted blended ones.
+    """
+    if schedule_adjust and point_source == "blended":
+        return "blended_sched"
+    return point_source
+
+
 def build_wtp_table(
     point_source: str = "historical",
     budget: int = SKILL_BUDGET,
     verbose: bool = True,
+    schedule_adjust: bool = False,
 ) -> pd.DataFrame:
     """
     Build the full WTP table.
@@ -696,6 +745,9 @@ def build_wtp_table(
     point_source : "historical", "espn", or "blended"
     budget       : skill-position budget (default $199, i.e. $200 − $1 DST)
     verbose      : print progress messages
+    schedule_adjust : Goal 13, Step 4 — only valid with point_source="blended".
+        Ranks/prices players off `schedule_adjusted_points` (weeks 1–11
+        strength-of-schedule adjusted) instead of raw blended projections.
 
     Returns
     -------
@@ -706,7 +758,8 @@ def build_wtp_table(
         wtp_price, flex_wtp_price,
         lp_y, lp_z, lp_b   (LP variable values — fractional in the relaxation)
     """
-    source_label = SOURCE_LABELS.get(point_source, point_source)
+    source_key = _effective_source_key(point_source, schedule_adjust)
+    source_label = SOURCE_LABELS.get(source_key, source_key)
     if verbose:
         print(f"\n=== Willingness-to-Pay Calculator (12-Team Market) ===")
         print(f"  Point source  : {source_label}")
@@ -718,7 +771,7 @@ def build_wtp_table(
     # 1. Build points table
     if verbose:
         print("\nStep 1 — Building expected-points table…")
-    points_table = build_points_table(point_source)
+    points_table = build_points_table(point_source, schedule_adjust=schedule_adjust)
     if verbose:
         for pos in ["QB", "RB", "WR", "TE"]:
             n = len(points_table[points_table["position"] == pos])
@@ -793,6 +846,7 @@ def save_wtp_position_tables(
     wtp_table: pd.DataFrame,
     point_source: str = "historical",
     budget: int = SKILL_BUDGET,
+    schedule_adjust: bool = False,
 ) -> Path:
     """
     Write a single Markdown document containing a WTP table for every slot of
@@ -802,8 +856,9 @@ def save_wtp_position_tables(
 
     Returns the path of the saved file.
     """
-    source_label = SOURCE_LABELS.get(point_source, point_source)
-    suffix       = SOURCE_SUFFIXES.get(point_source, f"_{point_source}")
+    source_key   = _effective_source_key(point_source, schedule_adjust)
+    source_label = SOURCE_LABELS.get(source_key, source_key)
+    suffix       = SOURCE_SUFFIXES.get(source_key, f"_{source_key}")
     out_path     = OUTPUT_DIR / f"wtp_by_position{suffix}.md"
 
     lines: list[str] = []
@@ -907,7 +962,7 @@ def save_wtp_position_tables(
     return out_path
 
 
-def run_wtp(point_source: str = "historical", budget: int = SKILL_BUDGET) -> pd.DataFrame:
+def run_wtp(point_source: str = "historical", budget: int = SKILL_BUDGET, schedule_adjust: bool = False) -> pd.DataFrame:
     """
     Build the WTP table, save output CSV and charts, and print a summary.
 
@@ -915,6 +970,9 @@ def run_wtp(point_source: str = "historical", budget: int = SKILL_BUDGET) -> pd.
     ----------
     point_source : "historical", "espn", or "blended"
     budget       : skill-position budget (default $199)
+    schedule_adjust : Goal 13, Step 4 — only valid with point_source="blended".
+        Writes to parallel "_blended_sched" output files instead of the
+        unadjusted blended ones.
     """
     try:
         from .visualize_par import (
@@ -928,20 +986,29 @@ def run_wtp(point_source: str = "historical", budget: int = SKILL_BUDGET) -> pd.
             plot_wtp_vs_espn_interactive,
         )
 
-    wtp_table = build_wtp_table(point_source=point_source, budget=budget, verbose=True)
+    wtp_table = build_wtp_table(
+        point_source=point_source, budget=budget, verbose=True, schedule_adjust=schedule_adjust
+    )
 
-    # Save CSV
+    source_key = _effective_source_key(point_source, schedule_adjust)
+    suffix     = SOURCE_SUFFIXES.get(source_key, f"_{source_key}")
+
+    # Save CSV (schedule-adjusted runs write to a parallel file so they don't
+    # clobber the unadjusted blended WTP CSV).
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    wtp_table.to_csv(WTP_CSV_PATH, index=False)
-    print(f"\nWTP table saved to {WTP_CSV_PATH}")
+    csv_path = DATA_DIR / f"willingness_to_pay{suffix}.csv" if schedule_adjust else WTP_CSV_PATH
+    wtp_table.to_csv(csv_path, index=False)
+    print(f"\nWTP table saved to {csv_path}")
 
     # Save per-position tables document
-    doc_path = save_wtp_position_tables(wtp_table, point_source=point_source, budget=budget)
+    doc_path = save_wtp_position_tables(
+        wtp_table, point_source=point_source, budget=budget, schedule_adjust=schedule_adjust
+    )
     print(f"WTP position tables saved to {doc_path}")
 
     # --- Print starter-range summary ---
-    source_label = SOURCE_LABELS.get(point_source, point_source)
+    source_label = SOURCE_LABELS.get(source_key, source_key)
     print(f"\n=== WTP Summary — Starter Slots ({source_label} points) ===")
 
     starter_table = wtp_table[
@@ -977,7 +1044,6 @@ def run_wtp(point_source: str = "historical", budget: int = SKILL_BUDGET) -> pd.
 
     # --- Charts ---
     print("\nGenerating charts…")
-    suffix = SOURCE_SUFFIXES.get(point_source, f"_{point_source}")
     plot_wtp_top20(wtp_table, suffix=suffix, source_label=source_label)
     plot_wtp_comparison(wtp_table, suffix=suffix, source_label=source_label)
     plot_wtp_vs_espn(wtp_table, suffix=suffix, source_label=source_label)
@@ -1023,7 +1089,20 @@ if __name__ == "__main__":
         metavar="DOLLARS",
         help=f"Skill-position budget (default: ${SKILL_BUDGET}, i.e. $200 − $1 DST).",
     )
+    parser.add_argument(
+        "--schedule-adjust",
+        action="store_true",
+        help=(
+            "Goal 13: re-rank/price blended players off weeks 1–11 "
+            "strength-of-schedule-adjusted points instead of raw blended "
+            "projections. Only valid together with --blended. Writes to "
+            "parallel '_blended_sched' output files."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.schedule_adjust and not args.blended:
+        parser.error("--schedule-adjust is only valid together with --blended.")
 
     if args.blended:
         source = "blended"
@@ -1031,4 +1110,4 @@ if __name__ == "__main__":
         source = "espn"
     else:
         source = "historical"
-    run_wtp(point_source=source, budget=args.budget)
+    run_wtp(point_source=source, budget=args.budget, schedule_adjust=args.schedule_adjust)

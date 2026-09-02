@@ -21,6 +21,7 @@ Usage:
 from __future__ import annotations
 
 import csv
+import json
 import logging
 import re
 import sys
@@ -44,6 +45,13 @@ ESPN_CSV = DATA_DIR / "espn_projected_values.csv"
 SLEEPER_CSV = DATA_DIR / "sleeper_projected_values.csv"
 ALIASES_CSV = DATA_DIR / "player_aliases.csv"
 UNMATCHED_REPORT_CSV = OUTPUT_DIR / "unmatched_players_report.csv"
+BLENDED_CSV = DATA_DIR / "blended_projected_values.csv"
+SLEEPER_PLAYERS_CACHE = DATA_DIR / "sleeper_players_cache.json"
+
+# Reason code used when a blended-pool player can't be resolved to an NFL
+# team via the Sleeper players cache (used by goal 13's schedule
+# adjustment, which needs a team to look up weekly opponents).
+NO_TEAM_MATCH_REASON = "no_team_match_for_schedule_adjustment"
 
 # Positions we care about for cross-source matching.
 VALID_POSITIONS = {"QB", "RB", "WR", "TE", "DST", "K"}
@@ -177,6 +185,110 @@ def load_historical_position_rank_curve(
 
 
 # ---------------------------------------------------------------------------
+# Goal 13, Step 2: player_name -> team lookup via Sleeper players cache
+# ---------------------------------------------------------------------------
+
+def load_sleeper_player_team_lookup(
+    alias_map: dict[str, str] | None = None,
+    cache_path: Path = SLEEPER_PLAYERS_CACHE,
+) -> dict[str, str]:
+    """
+    Build a `player_key ("normalized_name|POSITION") -> team abbreviation`
+    lookup from the cached Sleeper players dict (`sleeper_players_cache.json`).
+
+    Only players with a non-null `team` and a `position` in
+    `VALID_POSITIONS` are included. If multiple cached entries collide on
+    the same player_key (e.g. duplicate/retired records), the first entry
+    with a non-null team wins.
+    """
+    if not cache_path.exists():
+        log.warning(f"Sleeper players cache not found at {cache_path} — team lookup will be empty.")
+        return {}
+
+    with open(cache_path, encoding="utf-8") as fh:
+        players = json.load(fh)
+
+    lookup: dict[str, str] = {}
+    for info in players.values():
+        team = info.get("team")
+        position = normalize_position(info.get("position", ""))
+        full_name = info.get("full_name")
+        if not team or position not in VALID_POSITIONS or not full_name:
+            continue
+        key = build_player_key(full_name, position, alias_map)
+        lookup.setdefault(key, team)
+    return lookup
+
+
+def map_blended_players_to_team(
+    blended_df: pd.DataFrame,
+    alias_map: dict[str, str] | None = None,
+    team_lookup: dict[str, str] | None = None,
+) -> pd.DataFrame:
+    """
+    Add a `team` column to a blended projections DataFrame
+    (`player_name`, `position`, ...) by joining against the Sleeper
+    players-cache team lookup.
+
+    Players that can't be resolved to a team get `team = None` (schedule
+    adjustment should fall back to a 1.0/no-op multiplier for these rather
+    than dropping them).
+    """
+    if alias_map is None:
+        alias_map = load_alias_map()
+    if team_lookup is None:
+        team_lookup = load_sleeper_player_team_lookup(alias_map)
+
+    out = blended_df.copy()
+    out["player_key"] = [
+        build_player_key(n, p, alias_map) for n, p in zip(out["player_name"], out["position"])
+    ]
+    out["team"] = out["player_key"].map(team_lookup)
+    return out
+
+
+def report_unmatched_team_players(
+    mapped_df: pd.DataFrame,
+    output_path: Path = UNMATCHED_REPORT_CSV,
+    verbose: bool = True,
+) -> pd.DataFrame:
+    """
+    Append rows for blended-pool players whose `team` couldn't be resolved
+    (see `map_blended_players_to_team`) to the shared unmatched-players
+    report, tagged with `reason = NO_TEAM_MATCH_REASON`.
+
+    Existing rows in the report (from `report_unmatched`, i.e. cross-source
+    ESPN/Sleeper mismatches) are preserved; a `reason` column is added if
+    missing, defaulting existing rows to "cross_source_mismatch".
+    """
+    unmatched = mapped_df[mapped_df["team"].isna()].copy()
+    unmatched = unmatched[["player_key", "player_name", "position", "projected_points"]]
+    unmatched["reason"] = NO_TEAM_MATCH_REASON
+
+    if output_path.exists():
+        existing = pd.read_csv(output_path)
+        if "reason" not in existing.columns:
+            existing["reason"] = "cross_source_mismatch"
+        # Drop any stale rows from a previous run of this same check so
+        # re-running doesn't duplicate entries.
+        existing = existing[existing.get("reason") != NO_TEAM_MATCH_REASON]
+        combined = pd.concat([existing, unmatched], ignore_index=True, sort=False)
+    else:
+        combined = unmatched
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    combined.to_csv(output_path, index=False)
+
+    if verbose:
+        log.info(
+            f"{len(unmatched)}/{len(mapped_df)} blended players could not be matched to a team "
+            f"({NO_TEAM_MATCH_REASON}); appended to {output_path}"
+        )
+
+    return unmatched
+
+
+# ---------------------------------------------------------------------------
 # Cross-source join (ESPN ↔ Sleeper) + unmatched reporting
 # ---------------------------------------------------------------------------
 
@@ -260,6 +372,17 @@ def main() -> None:
     print("\nHistorical positional rank curve (sample):")
     curve = load_historical_position_rank_curve()
     print(curve.head(10).to_string(index=False))
+
+    if BLENDED_CSV.exists():
+        print("\nGoal 13, Step 2: mapping blended players -> team...")
+        blended = pd.read_csv(BLENDED_CSV)
+        team_lookup = load_sleeper_player_team_lookup(alias_map)
+        mapped = map_blended_players_to_team(blended, alias_map, team_lookup)
+        report_unmatched_team_players(mapped)
+        matched_pct = mapped["team"].notna().mean() * 100
+        print(f"Matched {matched_pct:.1f}% of {len(mapped)} blended players to a team.")
+    else:
+        log.info(f"No blended CSV found at {BLENDED_CSV} — skipping player->team mapping demo.")
 
 
 if __name__ == "__main__":

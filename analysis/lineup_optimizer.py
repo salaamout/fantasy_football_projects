@@ -234,9 +234,11 @@ def optimize_lineup(rankings: pd.DataFrame) -> pd.DataFrame:
 
 ESPN_DATA_PATH   = Path(__file__).parent.parent / "data" / "espn_projected_values.csv"
 BLENDED_DATA_PATH   = Path(__file__).parent.parent / "data" / "blended_projected_values.csv"
+BLENDED_SCHED_DATA_PATH = Path(__file__).parent.parent / "data" / "willingness_to_pay_blended_sched.csv"
 RINGER_DATA_PATH = Path(__file__).parent.parent / "data" / "ringer_2026_rankings.csv"
 ESPN_OUTPUT_PATH = Path(__file__).parent.parent / "output" / "espn_optimized_roster.csv"
 BLENDED_OUTPUT_PATH = Path(__file__).parent.parent / "output" / "blended_optimized_roster.csv"
+BLENDED_SCHED_OUTPUT_PATH = Path(__file__).parent.parent / "output" / "blended_sched_optimized_roster.csv"
 ESPN_LINEUP_SLOTS  = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "FLEX": 1}
 ESPN_BENCH_SLOTS   = 4
 ESPN_FLEX_POSITIONS = {"RB", "WR", "TE"}
@@ -264,6 +266,32 @@ def load_blended_player_pool() -> pd.DataFrame:
     df = blended.merge(price_cols, on="player_name", how="left")
     return df
 
+
+def load_blended_sched_player_pool() -> pd.DataFrame:
+    """
+    Build a player pool DataFrame for the schedule-adjusted blended
+    projections (Goal 13), reading `data/willingness_to_pay_blended_sched.csv`
+    (produced by `analysis/schedule_adjustment.py`).
+
+    Unlike `load_blended_player_pool`, auction values come straight from
+    that file's `espn_av` column (no re-join of ESPN auction values) — only
+    `team` / `overall_rank` are merged in from ESPN's salary-cap data by
+    player_name, purely for display purposes.
+
+    Returns a DataFrame with the columns `optimize_espn_lineup` expects:
+        player_name, position, team, overall_rank, positional_rank,
+        auction_value, projected_points
+    """
+    sched = pd.read_csv(BLENDED_SCHED_DATA_PATH)
+    sched = sched.rename(columns={
+        "expected_points": "projected_points",
+        "espn_av": "auction_value",
+    })
+    espn = pd.read_csv(ESPN_DATA_PATH)
+    meta_cols = espn[["player_name", "team", "overall_rank"]]
+    df = sched.merge(meta_cols, on="player_name", how="left")
+    return df
+
 # Pre-assigned DST: Texans defence at $1, 7.7 projected pts/game (≈ 130.9 over 17 games)
 TEXANS_DST = {
     "player_name": "Texans",
@@ -273,6 +301,8 @@ TEXANS_DST = {
     "positional_rank": None,
     "auction_value": 1,
     "projected_points": round(7.7 * 17, 1),  # 130.9
+    "expected_par": 0.0,
+    "flex_expected_par": 0.0,
     "slot": "DST",
 }
 
@@ -843,6 +873,17 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument(
+        "--blended-sched",
+        action="store_true",
+        help=(
+            "Run the salary-cap optimizer against the schedule-adjusted blended "
+            "projection instead (Goal 13). "
+            "Reads data/willingness_to_pay_blended_sched.csv, using its own "
+            "espn_av column for auction values (no re-join of ESPN prices). "
+            "Run `python -m analysis.schedule_adjustment` first if it's missing."
+        ),
+    )
+    parser.add_argument(
         "--budget",
         type=int,
         default=200,
@@ -890,8 +931,13 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ------------------------------------------------------------------ ESPN --
-    if args.espn or args.blended:
-        if args.blended:
+    if args.espn or args.blended or args.blended_sched:
+        if args.blended_sched:
+            print(f"Loading schedule-adjusted blended projected values from {BLENDED_SCHED_DATA_PATH}…")
+            players_df = load_blended_sched_player_pool()
+            output_path = BLENDED_SCHED_OUTPUT_PATH
+            label = "Blended + Schedule-Adjusted (ESPN + Sleeper + historical)"
+        elif args.blended:
             print(f"Loading blended projected values from {BLENDED_DATA_PATH}…")
             players_df = load_blended_player_pool()
             output_path = BLENDED_OUTPUT_PATH
@@ -914,18 +960,39 @@ if __name__ == "__main__":
             players_df["auction_value"] = (players_df["auction_value"] * (1 + args.boost / 100)).round(1)
             print(f"  Boost applied: auction_value increased by {args.boost:g}%.")
 
+        # Attach historical average PAR (points above replacement) as a
+        # reference column — not part of the optimizer's objective, which
+        # maximises raw projected_points, but useful for judging value.
+        repl_ranks     = REPLACEMENT_RANKS_WAIVER if args.waiver else REPLACEMENT_RANKS
+        flex_repl_rank = FLEX_REPLACEMENT_RANK_WAIVER if args.waiver else FLEX_REPLACEMENT_RANK
+        print("  Building historical average PAR lookup (reference column)…")
+        pos_lookup, flex_lookup = build_avg_par_lookup(
+            replacement_ranks=repl_ranks,
+            flex_replacement_rank=flex_repl_rank,
+        )
+        players_df = attach_expected_par(players_df, pos_lookup, flex_lookup)
+
         print(f"\nRunning {label} salary-cap optimizer (budget: ${args.budget})…")
         roster = optimize_espn_lineup(players_df, budget=args.budget)
+
+        # PAR for the slot the player actually fills (FLEX uses flex_expected_par)
+        roster["par"] = roster.apply(
+            lambda r: r["flex_expected_par"] if r["slot"] == "FLEX" else r["expected_par"],
+            axis=1,
+        ).round(1)
+        # Round point values to one decimal place for display/plotting
+        roster["projected_points"] = roster["projected_points"].round(1)
 
         starters = roster[roster["slot"] != "Bench"]
         bench    = roster[roster["slot"] == "Bench"]
         total_cost   = roster["auction_value"].sum()
         total_pts    = roster["projected_points"].sum()
         starter_pts  = starters["projected_points"].sum()
+        total_par    = starters["par"].sum()
 
         print(f"\n=== {label} Salary-Cap Optimal Roster (Budget: ${args.budget}) ===")
         display_cols = ["slot", "position", "player_name", "team",
-                        "overall_rank", "auction_value", "projected_points", "ppg"]
+                        "overall_rank", "auction_value", "projected_points", "par", "ppg"]
         print("\n--- Starters ---")
         print(starters[display_cols].to_string(index=False))
         print("\n--- Bench ---")
@@ -936,6 +1003,7 @@ if __name__ == "__main__":
         print(f"Total projected pts (all) : {total_pts:.1f}")
         print(f"Starter projected pts     : {starter_pts:.1f}")
         print(f"Starter projected pts/gm  : {starter_ppg:.1f}")
+        print(f"Starter total PAR         : {total_par:.1f}")
 
         output_path.parent.mkdir(parents=True, exist_ok=True)
         roster.to_csv(output_path, index=False)
@@ -991,7 +1059,7 @@ if __name__ == "__main__":
     lineup["slot_par"] = lineup.apply(
         lambda r: r["flex_expected_par"] if r["slot"] == "FLEX" else r["expected_par"],
         axis=1,
-    )
+    ).round(1)
     # Projected points per game for each player's slot (season total / 17 games)
     lineup["slot_points"] = lineup.apply(
         lambda r: r["flex_expected_points"] if r["slot"] == "FLEX" else r["expected_points"],

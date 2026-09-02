@@ -712,8 +712,83 @@ def plot_wtp_vs_espn_interactive(
         height=750,
     )
 
+    div_id = "wtp-chart"
+    chart_html = fig.to_html(include_plotlyjs="cdn", full_html=True, div_id=div_id)
+
+    search_ui = f"""
+    <div style="max-width:900px; margin:12px auto 0 auto; font-family:sans-serif;">
+      <label for="player-search"><b>Highlight player:</b></label>
+      <input type="text" id="player-search" placeholder="Type a player name..."
+             style="padding:6px 10px; width:300px; font-size:14px; margin-left:8px;
+                    border:1px solid #ccc; border-radius:4px;" />
+      <span id="player-search-count" style="margin-left:10px; color:#555; font-size:13px;"></span>
+    </div>
+    <script>
+    (function() {{
+        var gd = document.getElementById("{div_id}");
+        var input = document.getElementById("player-search");
+        var countLabel = document.getElementById("player-search-count");
+
+        function applyHighlight() {{
+            var query = input.value.trim().toLowerCase();
+            var traceIndices = [];
+            var sizeUpdates = [];
+            var opacityUpdates = [];
+            var lineWidthUpdates = [];
+            var lineColorUpdates = [];
+            var matchCount = 0;
+            var hoverPoints = [];
+
+            gd.data.forEach(function(trace, i) {{
+                if (!trace.customdata) {{ return; }}
+                traceIndices.push(i);
+                var sizes = [], opacities = [], lineWidths = [], lineColors = [];
+                trace.customdata.forEach(function(row, pointIndex) {{
+                    var name = String(row[0]).toLowerCase();
+                    var isMatch = query.length > 0 && name.indexOf(query) !== -1;
+                    if (isMatch) {{
+                        matchCount += 1;
+                        hoverPoints.push({{ curveNumber: i, pointNumber: pointIndex }});
+                    }}
+                    sizes.push(isMatch ? 20 : 10);
+                    opacities.push(query.length === 0 ? 1 : (isMatch ? 1 : 0.12));
+                    lineWidths.push(isMatch ? 2.5 : 0.5);
+                    lineColors.push(isMatch ? "black" : "white");
+                }});
+                sizeUpdates.push(sizes);
+                opacityUpdates.push(opacities);
+                lineWidthUpdates.push(lineWidths);
+                lineColorUpdates.push(lineColors);
+            }});
+
+            Plotly.restyle(gd, {{
+                "marker.size": sizeUpdates,
+                "marker.opacity": opacityUpdates,
+                "marker.line.width": lineWidthUpdates,
+                "marker.line.color": lineColorUpdates,
+            }}, traceIndices);
+
+            countLabel.textContent = query.length === 0
+                ? ""
+                : (matchCount + " match" + (matchCount === 1 ? "" : "es"));
+
+            if (hoverPoints.length > 0 && hoverPoints.length <= 25) {{
+                Plotly.Fx.hover(gd, hoverPoints);
+            }} else {{
+                Plotly.Fx.hover(gd, []);
+            }}
+        }}
+
+        input.addEventListener("input", applyHighlight);
+    }})();
+    </script>
+    """
+
+    chart_html = chart_html.replace("</body>", search_ui + "</body>")
+
     out_path = os.path.join(OUTPUT_DIR, f"wtp_vs_espn_estimates{suffix}.html")
-    fig.write_html(out_path, include_plotlyjs="cdn")
+    with open(out_path, "w") as f:
+        f.write(chart_html)
     print(f"Saved: {out_path}")
 
 

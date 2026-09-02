@@ -30,6 +30,8 @@ data/output/
 *.csv
 *.parquet
 *.feather
+data/sleeper_players_cache.json
+data/sleeper_projections_cache/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/

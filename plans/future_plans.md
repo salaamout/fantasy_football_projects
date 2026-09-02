@@ -1,3 +1,7 @@
+- Web app that shows the willingness to pay plot but allows me to update as the players are chosen
+  - Should remove chosen players from the board
+  - Should update the shadow price with the REAL price as the price becomes known, and iterate the plot
+  - Should constantly show my "optimal" team assuming everyone goes at the estimated price
 - Look at QB thing: are QBs inherently less predictable and therefore paying more for a top projected qb is a bad idea?
 - Try a mock draft with the willingness to pay table (CHECK)
 - There doesn't need to be one price! Experiment with multiple
