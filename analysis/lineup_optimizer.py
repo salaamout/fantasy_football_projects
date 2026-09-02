@@ -233,11 +233,36 @@ def optimize_lineup(rankings: pd.DataFrame) -> pd.DataFrame:
 
 
 ESPN_DATA_PATH   = Path(__file__).parent.parent / "data" / "espn_projected_values.csv"
+BLENDED_DATA_PATH   = Path(__file__).parent.parent / "data" / "blended_projected_values.csv"
 RINGER_DATA_PATH = Path(__file__).parent.parent / "data" / "ringer_2026_rankings.csv"
 ESPN_OUTPUT_PATH = Path(__file__).parent.parent / "output" / "espn_optimized_roster.csv"
+BLENDED_OUTPUT_PATH = Path(__file__).parent.parent / "output" / "blended_optimized_roster.csv"
 ESPN_LINEUP_SLOTS  = {"QB": 1, "RB": 2, "WR": 3, "TE": 1, "FLEX": 1}
 ESPN_BENCH_SLOTS   = 4
 ESPN_FLEX_POSITIONS = {"RB", "WR", "TE"}
+
+
+def load_blended_player_pool() -> pd.DataFrame:
+    """
+    Build a player pool DataFrame for the blended (ESPN + Sleeper + historical)
+    projections (Goal 10), with `team` / `overall_rank` / `auction_value`
+    merged in from ESPN's salary-cap data by player_name.
+
+    The blended CSV's `player_name` prefers the ESPN name when available (see
+    `analysis.player_id_matching.build_player_key_table`), so a name join
+    covers the vast majority of players; anyone without an ESPN auction value
+    (e.g. Sleeper-only players) is dropped since `optimize_espn_lineup`
+    requires an auction_value to price them.
+
+    Returns a DataFrame with the same columns `optimize_espn_lineup` expects:
+        player_name, position, team, overall_rank, positional_rank,
+        auction_value, projected_points
+    """
+    blended = pd.read_csv(BLENDED_DATA_PATH)
+    espn = pd.read_csv(ESPN_DATA_PATH)
+    price_cols = espn[["player_name", "team", "overall_rank", "auction_value"]]
+    df = blended.merge(price_cols, on="player_name", how="left")
+    return df
 
 # Pre-assigned DST: Texans defence at $1, 7.7 projected pts/game (≈ 130.9 over 17 games)
 TEXANS_DST = {
@@ -653,8 +678,11 @@ def run_cross_source_optimization(budget: int = 200) -> dict:
                 lambda r: r["flex_expected_points"] if r["slot"] == "FLEX" else r["expected_points"],
                 axis=1,
             )
-            skill_pts   = lineup["slot_points"].sum()
+            lineup["ppg"] = (lineup["slot_points"] / 17).round(1)
+            starters_df = lineup[lineup["slot"] != "Bench"]
+            skill_pts   = starters_df["slot_points"].sum()
             total_pts   = skill_pts + DST_PLACEHOLDER_POINTS
+            total_ppg   = skill_pts / 17 + DST_PLACEHOLDER_POINTS / 17
             total_cost  = lineup["auction_value"].sum() + 1  # +$1 for DST
 
             results[combo_id] = {
@@ -662,6 +690,7 @@ def run_cross_source_optimization(budget: int = 200) -> dict:
                 "lineup":       lineup,
                 "total_points": total_pts,
                 "skill_points": skill_pts,
+                "total_ppg":    total_ppg,
                 "total_cost":   total_cost,
             }
 
@@ -669,7 +698,7 @@ def run_cross_source_optimization(budget: int = 200) -> dict:
             csv_path = OUTPUT_DIR / f"cross_source_{combo_id.lower()}.csv"
             lineup.to_csv(csv_path, index=False)
             print(f"  Saved: {csv_path}")
-            print(f"  Total projected points (incl. DST): {total_pts:.1f}  |  Cost: ${total_cost}")
+            print(f"  Total projected points (incl. DST): {total_pts:.1f}  |  Pts/game: {total_ppg:.1f}  |  Cost: ${total_cost}")
 
         except Exception as e:
             print(f"  ERROR in combo {combo_id}: {e}")
@@ -704,13 +733,13 @@ def run_cross_source_optimization(budget: int = 200) -> dict:
             if slot_key == "Bench":
                 if bench_idx < len(bench_df):
                     p = bench_df.iloc[bench_idx]
-                    pts = p["expected_points"]
+                    ppg = p["expected_points"] / 17
                     rows_out.append({
                         "slot":   f"Bench {bench_idx + 1}",
                         "pos":    p["position"],
                         "name":   p["player_name"],
                         "cost":   int(p["auction_value"]),
-                        "points": pts,
+                        "points": ppg,
                     })
                     bench_idx += 1
                 else:
@@ -723,13 +752,14 @@ def run_cross_source_optimization(budget: int = 200) -> dict:
                 if len(matching) >= nth:
                     p = matching.iloc[nth - 1]
                     pts = p["flex_expected_points"] if slot_key == "FLEX" else p["expected_points"]
+                    ppg = pts / 17
                     label = slot_key if nth == 1 else f"{slot_key}{nth}"
                     rows_out.append({
                         "slot":   label,
                         "pos":    p["position"],
                         "name":   p["player_name"],
                         "cost":   int(p["auction_value"]),
-                        "points": pts,
+                        "points": ppg,
                     })
                 else:
                     rows_out.append({"slot": slot_key, "pos": "—", "name": "—", "cost": 0, "points": 0.0})
@@ -744,7 +774,7 @@ def run_cross_source_optimization(budget: int = 200) -> dict:
 
         header_line = (
             f"  {'Slot':<8}  {'Pos':<6}  {'Player':<{COL_WIDTH_NAME}}  "
-            f"{'Cost':>{COL_WIDTH_NUM}}  {'Proj Pts':>{COL_WIDTH_NUM}}"
+            f"{'Cost':>{COL_WIDTH_NUM}}  {'Pts/Gm':>{COL_WIDTH_NUM}}"
         )
         separator = "  " + "-" * (len(header_line) - 2)
 
@@ -762,12 +792,12 @@ def run_cross_source_optimization(budget: int = 200) -> dict:
         skill_cost = sum(tr["cost"] for tr in table_rows if "Bench" not in tr["slot"])
         print(
             f"  {'TOTAL':<8}  {'':6}  {'(+ $1 DST)':<{COL_WIDTH_NAME}}  "
-            f"${r['total_cost']:>{COL_WIDTH_NUM - 1}}  {r['total_points']:>{COL_WIDTH_NUM}.1f}"
+            f"${r['total_cost']:>{COL_WIDTH_NUM - 1}}  {r['total_ppg']:>{COL_WIDTH_NUM}.1f}"
         )
 
     # Summary across all combos
     print("\n=== Summary ===")
-    sum_header = f"  {'Combo':<20}  {'Proj Pts':>10}  {'Cost':>6}"
+    sum_header = f"  {'Combo':<20}  {'Proj Pts':>10}  {'Pts/Gm':>8}  {'Cost':>6}"
     print(sum_header)
     print("  " + "-" * (len(sum_header) - 2))
     for combo_id, *_ in combos:
@@ -775,7 +805,7 @@ def run_cross_source_optimization(budget: int = 200) -> dict:
             continue
         r = results[combo_id]
         combo_label = f"Combo {combo_id}: {r['label']}"
-        print(f"  {combo_label:<20}  {r['total_points']:>10.1f}  ${r['total_cost']:>5}")
+        print(f"  {combo_label:<20}  {r['total_points']:>10.1f}  {r['total_ppg']:>8.1f}  ${r['total_cost']:>5}")
 
     # Bar chart
     plot_cross_source_comparison(results)
@@ -799,6 +829,17 @@ if __name__ == "__main__":
         help=(
             "Run the ESPN salary-cap optimizer instead of the Ringer PAR optimizer. "
             "Reads data/espn_projected_values.csv and maximises projected_points."
+        ),
+    )
+    parser.add_argument(
+        "--blended",
+        action="store_true",
+        help=(
+            "Run the salary-cap optimizer against the blended ESPN + Sleeper + "
+            "historical projection instead (Goal 10). "
+            "Reads data/blended_projected_values.csv, joined to ESPN auction "
+            "values by player_name. "
+            "Run `python -m analysis.load_multi_source_projections` first if it's missing."
         ),
     )
     parser.add_argument(
@@ -849,23 +890,32 @@ if __name__ == "__main__":
         sys.exit(0)
 
     # ------------------------------------------------------------------ ESPN --
-    if args.espn:
-        print(f"Loading ESPN projected values from {ESPN_DATA_PATH}…")
-        espn_df = pd.read_csv(ESPN_DATA_PATH)
-        before = len(espn_df)
-        espn_df = espn_df.dropna(subset=["projected_points", "auction_value"])
-        dropped = before - len(espn_df)
+    if args.espn or args.blended:
+        if args.blended:
+            print(f"Loading blended projected values from {BLENDED_DATA_PATH}…")
+            players_df = load_blended_player_pool()
+            output_path = BLENDED_OUTPUT_PATH
+            label = "Blended (ESPN + Sleeper + historical)"
+        else:
+            print(f"Loading ESPN projected values from {ESPN_DATA_PATH}…")
+            players_df = pd.read_csv(ESPN_DATA_PATH)
+            output_path = ESPN_OUTPUT_PATH
+            label = "ESPN"
+
+        before = len(players_df)
+        players_df = players_df.dropna(subset=["projected_points", "auction_value"])
+        dropped = before - len(players_df)
         if dropped:
             print(f"  Dropped {dropped} players with missing projected_points or auction_value.")
-        print(f"  {len(espn_df)} players available.")
+        print(f"  {len(players_df)} players available.")
 
         if args.boost:
-            espn_df = espn_df.copy()
-            espn_df["auction_value"] = (espn_df["auction_value"] * (1 + args.boost / 100)).round(1)
+            players_df = players_df.copy()
+            players_df["auction_value"] = (players_df["auction_value"] * (1 + args.boost / 100)).round(1)
             print(f"  Boost applied: auction_value increased by {args.boost:g}%.")
 
-        print(f"\nRunning ESPN salary-cap optimizer (budget: ${args.budget})…")
-        roster = optimize_espn_lineup(espn_df, budget=args.budget)
+        print(f"\nRunning {label} salary-cap optimizer (budget: ${args.budget})…")
+        roster = optimize_espn_lineup(players_df, budget=args.budget)
 
         starters = roster[roster["slot"] != "Bench"]
         bench    = roster[roster["slot"] == "Bench"]
@@ -873,21 +923,23 @@ if __name__ == "__main__":
         total_pts    = roster["projected_points"].sum()
         starter_pts  = starters["projected_points"].sum()
 
-        print(f"\n=== ESPN Salary-Cap Optimal Roster (Budget: ${args.budget}) ===")
+        print(f"\n=== {label} Salary-Cap Optimal Roster (Budget: ${args.budget}) ===")
         display_cols = ["slot", "position", "player_name", "team",
                         "overall_rank", "auction_value", "projected_points", "ppg"]
         print("\n--- Starters ---")
         print(starters[display_cols].to_string(index=False))
         print("\n--- Bench ---")
         print(bench[display_cols].to_string(index=False))
+        starter_ppg  = starters["ppg"].sum()
         print(f"\nTotal auction cost        : ${total_cost}")
         print(f"Remaining budget          : ${args.budget - total_cost}")
         print(f"Total projected pts (all) : {total_pts:.1f}")
         print(f"Starter projected pts     : {starter_pts:.1f}")
+        print(f"Starter projected pts/gm  : {starter_ppg:.1f}")
 
-        ESPN_OUTPUT_PATH.parent.mkdir(parents=True, exist_ok=True)
-        roster.to_csv(ESPN_OUTPUT_PATH, index=False)
-        print(f"\nRoster saved to {ESPN_OUTPUT_PATH}")
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        roster.to_csv(output_path, index=False)
+        print(f"\nRoster saved to {output_path}")
         sys.exit(0)
 
     # --------------------------------------------------------------- Ringer --
@@ -923,6 +975,11 @@ if __name__ == "__main__":
 
     rankings = attach_expected_par(rankings, pos_lookup, flex_lookup, rank_window=rank_window)
 
+    # Historical average raw points (not PAR) for projected points-per-game display
+    print("Building historical average points lookup (2021–2025)…")
+    avg_points, avg_flex_points = build_avg_points_lookup()
+    rankings = attach_expected_points(rankings, avg_points, avg_flex_points, rank_window=rank_window)
+
     if args.boost:
         rankings["auction_value"] = (rankings["auction_value"] * (1 + args.boost / 100)).round(1)
         print(f"  Boost applied: auction_value increased by {args.boost:g}%.")
@@ -935,17 +992,25 @@ if __name__ == "__main__":
         lambda r: r["flex_expected_par"] if r["slot"] == "FLEX" else r["expected_par"],
         axis=1,
     )
+    # Projected points per game for each player's slot (season total / 17 games)
+    lineup["slot_points"] = lineup.apply(
+        lambda r: r["flex_expected_points"] if r["slot"] == "FLEX" else r["expected_points"],
+        axis=1,
+    )
+    lineup["ppg"] = (lineup["slot_points"] / 17).round(1)
 
     total_cost = lineup["auction_value"].sum()
     total_par  = lineup["slot_par"].sum()
+    total_ppg  = lineup["ppg"].sum()
 
     print(f"\n=== Optimal Starting Lineup (Budget: ${BUDGET}) — {mode_label} PAR | {uncertainty_label} | {boost_label} ===")
     print(
         lineup[["slot", "position", "player_name", "team", "positional_rank",
-                 "auction_value", "slot_par"]]
+                 "auction_value", "slot_par", "ppg"]]
         .rename(columns={"slot_par": "expected_par"})
         .to_string(index=False)
     )
-    print(f"\nTotal auction cost : ${total_cost}")
-    print(f"Total expected PAR : {total_par:.1f}")
-    print(f"Remaining budget   : ${BUDGET - total_cost}")
+    print(f"\nTotal auction cost         : ${total_cost}")
+    print(f"Total expected PAR         : {total_par:.1f}")
+    print(f"Starting lineup pts/game   : {total_ppg:.1f}")
+    print(f"Remaining budget           : ${BUDGET - total_cost}")

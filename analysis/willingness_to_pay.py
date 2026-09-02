@@ -17,9 +17,11 @@ into the allocation and produces meaningful shadow prices for them.  The WTP
 formula still outputs a single-team dollar value — there is no division by 12.
 The slot dual already represents the per-slot scarcity premium.
 
-Two expected-points sources are supported:
+Three expected-points sources are supported:
   historical  (default) — 5-year average half-PPR points (2021–2025)
   espn                  — ESPN 2026 projected points
+  blended               — blended ESPN + Sleeper + historical projections
+                           (see analysis/load_multi_source_projections.py)
 
 League / lineup settings (single team)
     Budget              : $200 total, $1 reserved for DST → $199 skill budget
@@ -30,6 +32,7 @@ League / lineup settings (single team)
 Usage
     python -m analysis.willingness_to_pay               # historical points
     python -m analysis.willingness_to_pay --espn        # ESPN projected points
+    python -m analysis.willingness_to_pay --blended     # blended projected points
     python -m analysis.willingness_to_pay --help
 """
 
@@ -72,8 +75,21 @@ except ImportError:
 # Constants
 # ---------------------------------------------------------------------------
 ESPN_DATA_PATH        = DATA_DIR / "espn_projected_values.csv"
+BLENDED_DATA_PATH     = DATA_DIR / "blended_projected_values.csv"
 METHOD1_AV_PATH       = DATA_DIR / "cross_position_ranking.csv"
 WTP_CSV_PATH          = DATA_DIR / "willingness_to_pay.csv"
+
+# Point-source display labels / output-filename suffixes
+SOURCE_LABELS = {
+    "historical": "historical avg (2021–2025)",
+    "espn":       "ESPN 2026 projected",
+    "blended":    "Blended (ESPN + Sleeper + historical)",
+}
+SOURCE_SUFFIXES = {
+    "historical": "_historical",
+    "espn":       "_espn",
+    "blended":    "_blended",
+}
 
 SKILL_BUDGET          = 199          # $200 − $1 for DST (single-team budget)
 NUM_TEAMS             = 12           # league size — LP fills all 12 rosters simultaneously
@@ -184,13 +200,71 @@ def _build_espn_points_table() -> pd.DataFrame:
     return df_out
 
 
+def _build_blended_points_table() -> pd.DataFrame:
+    """
+    Return a tidy DataFrame of blended (ESPN + Sleeper + historical) projected
+    points indexed by (position, positional_rank), mirroring the schema used
+    by `_build_espn_points_table`.
+
+    Columns: position, positional_rank, player_name, expected_points,
+             par_points, flex_expected_points, flex_par_points
+
+    `player_name` is carried through so that auction-value pricing (Step 2)
+    can join to ESPN's salary-cap data by name — the blended source's own
+    positional_rank does not line up with ESPN's positional_rank, since it's
+    re-ranked by the blended point value.
+    """
+    if not BLENDED_DATA_PATH.exists():
+        raise FileNotFoundError(
+            f"Blended projections not found at {BLENDED_DATA_PATH}. "
+            "Run `python -m analysis.load_multi_source_projections` first."
+        )
+
+    blended = pd.read_csv(BLENDED_DATA_PATH)
+    blended = blended[blended["position"].isin(SKILL_POSITIONS)].copy()
+    blended = blended.dropna(subset=["projected_points", "positional_rank"])
+    blended["positional_rank"] = blended["positional_rank"].astype(int)
+    blended = blended.sort_values(["position", "positional_rank"]).reset_index(drop=True)
+
+    rows = []
+    for _, row in blended.iterrows():
+        pos  = row["position"]
+        rank = int(row["positional_rank"])
+        ep   = float(row["projected_points"])
+        fep  = ep if pos in FLEX_POSITIONS else 0.0
+        rows.append({
+            "position":             pos,
+            "positional_rank":      rank,
+            "player_name":          row["player_name"],
+            "expected_points":      ep,
+            "par_points":           0.0,           # filled in after loop
+            "flex_expected_points": fep,
+            "flex_par_points":      0.0,           # filled in after loop
+        })
+
+    df_out = pd.DataFrame(rows)
+
+    # Compute replacement baseline from the blended data itself
+    for pos in df_out["position"].unique():
+        rep_rank = REPLACEMENT_RANKS.get(pos)
+        rep_rows = df_out[(df_out["position"] == pos) & (df_out["positional_rank"] == rep_rank)]
+        rep_pts  = rep_rows["expected_points"].values[0] if not rep_rows.empty else 0.0
+        mask = df_out["position"] == pos
+        df_out.loc[mask, "par_points"]      = df_out.loc[mask, "expected_points"] - rep_pts
+        df_out.loc[mask, "flex_par_points"] = df_out.loc[mask, "flex_expected_points"].apply(
+            lambda x: (x - rep_pts) if x > 0 else 0.0
+        )
+
+    return df_out
+
+
 def build_points_table(point_source: str = "historical") -> pd.DataFrame:
     """
     Build the expected-points table for the LP.
 
     Parameters
     ----------
-    point_source : "historical" (default) or "espn"
+    point_source : "historical" (default), "espn", or "blended"
 
     Returns
     -------
@@ -201,8 +275,12 @@ def build_points_table(point_source: str = "historical") -> pd.DataFrame:
         return _build_espn_points_table()
     elif point_source == "historical":
         return _build_historical_points_table()
+    elif point_source == "blended":
+        return _build_blended_points_table()
     else:
-        raise ValueError(f"Unknown point_source: {point_source!r}. Choose 'historical' or 'espn'.")
+        raise ValueError(
+            f"Unknown point_source: {point_source!r}. Choose 'historical', 'espn', or 'blended'."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -236,20 +314,42 @@ def load_espn_auction_values() -> dict[tuple[str, int], float]:
     }
 
 
+def load_espn_auction_values_by_name() -> dict[str, float]:
+    """
+    Load ESPN estimated auction values keyed by player_name instead of
+    (position, positional_rank). Needed for the blended source, whose
+    positional_rank is re-derived from the blended point value and no longer
+    lines up with ESPN's own positional_rank.
+    """
+    df = pd.read_csv(ESPN_DATA_PATH)
+    df = df[df["position"].isin(SKILL_POSITIONS)]
+    return {row["player_name"]: float(row["auction_value"]) for _, row in df.iterrows()}
+
+
 def attach_prices(
     points_table: pd.DataFrame,
     method1_avs: dict[tuple[str, int], float],
     min_price: float = 1.0,
+    name_avs: dict[str, float] | None = None,
 ) -> pd.DataFrame:
     """
-    Attach a `price` column to the points table using Method 1 auction values.
-    Players beyond the starter range default to min_price.
+    Attach a `price` column to the points table using auction values.
+
+    By default prices are looked up by (position, positional_rank) via
+    `method1_avs`. If `name_avs` is provided and the table has a
+    `player_name` column, prices are instead looked up by player name — this
+    is required for the blended source (see `load_espn_auction_values_by_name`).
+
+    Players beyond the starter range / without a match default to min_price.
     """
     df = points_table.copy()
-    df["method1_av"] = df.apply(
-        lambda r: method1_avs.get((r["position"], int(r["positional_rank"])), 0.0),
-        axis=1,
-    )
+    if name_avs is not None and "player_name" in df.columns:
+        df["method1_av"] = df["player_name"].map(name_avs).fillna(0.0)
+    else:
+        df["method1_av"] = df.apply(
+            lambda r: method1_avs.get((r["position"], int(r["positional_rank"])), 0.0),
+            axis=1,
+        )
     df["price"] = df["method1_av"].clip(lower=min_price)
     return df
 
@@ -593,7 +693,7 @@ def build_wtp_table(
 
     Parameters
     ----------
-    point_source : "historical" or "espn"
+    point_source : "historical", "espn", or "blended"
     budget       : skill-position budget (default $199, i.e. $200 − $1 DST)
     verbose      : print progress messages
 
@@ -606,7 +706,7 @@ def build_wtp_table(
         wtp_price, flex_wtp_price,
         lp_y, lp_z, lp_b   (LP variable values — fractional in the relaxation)
     """
-    source_label = "ESPN 2026 projected" if point_source == "espn" else "historical avg (2021–2025)"
+    source_label = SOURCE_LABELS.get(point_source, point_source)
     if verbose:
         print(f"\n=== Willingness-to-Pay Calculator (12-Team Market) ===")
         print(f"  Point source  : {source_label}")
@@ -632,11 +732,19 @@ def build_wtp_table(
     # budget constraint non-binding and λ = 0.  ESPN values sum to ~$2,527 and
     # produce a binding budget constraint so that λ correctly reflects the
     # competitive market clearing rate.
+    #
+    # For the "blended" source, positional_rank no longer lines up with ESPN's
+    # own positional_rank (it's re-derived from the blended point value), so
+    # prices must be joined by player_name instead of (position, rank).
     if verbose:
         print("\nStep 2 — Attaching ESPN auction values as prices (competitive market calibration)…")
-    price_avs = load_espn_auction_values()
     method1_avs = load_method1_auction_values()   # still needed for the output column
-    player_pool = attach_prices(points_table, price_avs)
+    if point_source == "blended":
+        name_avs = load_espn_auction_values_by_name()
+        player_pool = attach_prices(points_table, method1_avs, name_avs=name_avs)
+    else:
+        price_avs = load_espn_auction_values()
+        player_pool = attach_prices(points_table, price_avs)
     # Restore the method1_av column to real Method 1 values (attach_prices names
     # its lookup column "method1_av" regardless of which price source was passed).
     if True:
@@ -665,12 +773,18 @@ def build_wtp_table(
     deep     = wtp_table[wtp_table["positional_rank"] > wtp_table["position"].map(STARTER_CUTOFFS)].copy()
     wtp_table = pd.concat([starters, deep], ignore_index=True)
 
-    # Attach ESPN auction values for comparison plots
-    espn_avs = load_espn_auction_values()
-    wtp_table["espn_av"] = wtp_table.apply(
-        lambda r: espn_avs.get((r["position"], int(r["positional_rank"])), 0.0),
-        axis=1,
-    )
+    # Attach ESPN auction values for comparison plots.
+    # For "blended" source, positional_rank doesn't line up with ESPN's own
+    # rank, so join by player_name instead.
+    if point_source == "blended" and "player_name" in wtp_table.columns:
+        espn_avs_by_name = load_espn_auction_values_by_name()
+        wtp_table["espn_av"] = wtp_table["player_name"].map(espn_avs_by_name).fillna(0.0)
+    else:
+        espn_avs = load_espn_auction_values()
+        wtp_table["espn_av"] = wtp_table.apply(
+            lambda r: espn_avs.get((r["position"], int(r["positional_rank"])), 0.0),
+            axis=1,
+        )
 
     return wtp_table
 
@@ -688,8 +802,8 @@ def save_wtp_position_tables(
 
     Returns the path of the saved file.
     """
-    source_label = "ESPN 2026 Projected" if point_source == "espn" else "Historical Avg (2021–2025)"
-    suffix       = "_espn" if point_source == "espn" else "_historical"
+    source_label = SOURCE_LABELS.get(point_source, point_source)
+    suffix       = SOURCE_SUFFIXES.get(point_source, f"_{point_source}")
     out_path     = OUTPUT_DIR / f"wtp_by_position{suffix}.md"
 
     lines: list[str] = []
@@ -799,14 +913,20 @@ def run_wtp(point_source: str = "historical", budget: int = SKILL_BUDGET) -> pd.
 
     Parameters
     ----------
-    point_source : "historical" or "espn"
+    point_source : "historical", "espn", or "blended"
     budget       : skill-position budget (default $199)
     """
     try:
-        from .visualize_par import plot_wtp_top20, plot_wtp_comparison, plot_wtp_vs_espn
+        from .visualize_par import (
+            plot_wtp_top20, plot_wtp_comparison, plot_wtp_vs_espn,
+            plot_wtp_vs_espn_interactive,
+        )
     except ImportError:
         sys.path.insert(0, str(_HERE))
-        from visualize_par import plot_wtp_top20, plot_wtp_comparison, plot_wtp_vs_espn
+        from visualize_par import (
+            plot_wtp_top20, plot_wtp_comparison, plot_wtp_vs_espn,
+            plot_wtp_vs_espn_interactive,
+        )
 
     wtp_table = build_wtp_table(point_source=point_source, budget=budget, verbose=True)
 
@@ -821,7 +941,7 @@ def run_wtp(point_source: str = "historical", budget: int = SKILL_BUDGET) -> pd.
     print(f"WTP position tables saved to {doc_path}")
 
     # --- Print starter-range summary ---
-    source_label = "ESPN projected" if point_source == "espn" else "Hist avg"
+    source_label = SOURCE_LABELS.get(point_source, point_source)
     print(f"\n=== WTP Summary — Starter Slots ({source_label} points) ===")
 
     starter_table = wtp_table[
@@ -857,10 +977,11 @@ def run_wtp(point_source: str = "historical", budget: int = SKILL_BUDGET) -> pd.
 
     # --- Charts ---
     print("\nGenerating charts…")
-    suffix = "_espn" if point_source == "espn" else "_historical"
+    suffix = SOURCE_SUFFIXES.get(point_source, f"_{point_source}")
     plot_wtp_top20(wtp_table, suffix=suffix, source_label=source_label)
     plot_wtp_comparison(wtp_table, suffix=suffix, source_label=source_label)
     plot_wtp_vs_espn(wtp_table, suffix=suffix, source_label=source_label)
+    plot_wtp_vs_espn_interactive(wtp_table, suffix=suffix, source_label=source_label)
 
     return wtp_table
 
@@ -875,14 +996,25 @@ if __name__ == "__main__":
             "Goal 9 — Principled Willingness-to-Pay by roster slot.\n\n"
             "Computes shadow prices via LP relaxation of the lineup optimizer. "
             "By default uses 5-year historical average points (2021–2025); "
-            "use --espn for ESPN 2026 projected points."
+            "use --espn for ESPN 2026 projected points, or --blended for the "
+            "blended ESPN + Sleeper + historical projection."
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument(
+    source_group = parser.add_mutually_exclusive_group()
+    source_group.add_argument(
         "--espn",
         action="store_true",
         help="Use ESPN 2026 projected points instead of 5-year historical averages.",
+    )
+    source_group.add_argument(
+        "--blended",
+        action="store_true",
+        help=(
+            "Use the blended ESPN + Sleeper + historical projection "
+            "(data/blended_projected_values.csv). "
+            "Run `python -m analysis.load_multi_source_projections` first if it's missing."
+        ),
     )
     parser.add_argument(
         "--budget",
@@ -893,5 +1025,10 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    source = "espn" if args.espn else "historical"
+    if args.blended:
+        source = "blended"
+    elif args.espn:
+        source = "espn"
+    else:
+        source = "historical"
     run_wtp(point_source=source, budget=args.budget)

@@ -2,8 +2,14 @@
 - Try a mock draft with the willingness to pay table (CHECK)
 - There doesn't need to be one price! Experiment with multiple
 - App to auto-update prices as we go
-- Use multiple predicted points sources (fantasypros? yahoo? sleeper? history?)
+- Use multiple predicted points sources (fantasypros? yahoo? sleeper? history?) (CHECK — blended ESPN+Sleeper+historical source added, see Goal 10)
+- Open questions from Goal 10 (blended projections) to revisit:
+  - Current blend weighting is a simple/uniform average across sources — should weights be tuned (e.g. weight ESPN or Sleeper higher for skill positions with more betting-market signal)?
+  - Blended WTP is consistently higher than historical-only for mid/late RBs (see `output/wtp_source_comparison.md`) — is this blend smoothing out real bust risk, or correcting for stale historical data?
+  - Add FantasyPros and/or Yahoo as additional projection sources to the blend once `load_multi_source_projections.py` supports >2 non-historical sources cleanly.
+  - Consider re-running `compare_wtp_sources.py` after each new source is added to track how WTP recommendations drift over time.
+- Add a Sleeper option to the lineup optimizer
 - Goal isn't to get the highest predicted points, it's to maximize my odds of winning as many of the first 11 games as possible
   - Model uncertainty (particularly upside, think in terms of RB1 upside or whatever)
   - Model strength of schedule (ESPN has a per week prediction already I believe, use that to give each player a boost or drop for the first 11 weeks)
-  - Model 
+  - 

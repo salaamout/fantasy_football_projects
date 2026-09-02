@@ -625,6 +625,139 @@ def plot_wtp_vs_espn(
     print(f"Saved: {out_path}")
 
 
+def plot_wtp_vs_espn_interactive(
+    wtp_df: pd.DataFrame,
+    suffix: str = "_historical",
+    source_label: str = "Hist avg",
+) -> None:
+    """
+    Interactive (Plotly) version of `plot_wtp_vs_espn`: WTP price (x-axis) vs.
+    ESPN Estimated Auction Value (y-axis), coloured by position, with a y=x
+    reference line, zoom/pan controls, and player-name hover tooltips.
+
+    Saves to output/wtp_vs_espn_estimates{suffix}.html.
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        print("plotly is not installed; skipping interactive WTP vs ESPN chart. "
+              "Install with `pip install plotly`.")
+        return
+
+    _ensure_output_dir()
+
+    STARTER_CUTOFFS_LOCAL = {"QB": 12, "RB": 31, "WR": 41, "TE": 12}
+    plot_df = wtp_df[
+        (wtp_df["positional_rank"] <= wtp_df["position"].map(STARTER_CUTOFFS_LOCAL))
+        & (wtp_df["espn_av"] > 0)
+    ].copy()
+
+    axis_max = max(plot_df["wtp_price"].max(), plot_df["espn_av"].max()) * 1.08
+
+    fig = go.Figure()
+
+    # Shaded overpriced / underpriced regions
+    fig.add_shape(
+        type="rect", x0=0, y0=0, x1=axis_max, y1=axis_max,
+        fillcolor="green", opacity=0.04, line_width=0, layer="below",
+    )
+    fig.add_shape(
+        type="rect", x0=0, y0=0, x1=axis_max, y1=axis_max,
+        fillcolor="red", opacity=0.04, line_width=0, layer="below",
+    )
+
+    # y = x reference line
+    fig.add_trace(go.Scatter(
+        x=[0, axis_max], y=[0, axis_max],
+        mode="lines",
+        line=dict(color="gray", width=1.2, dash="dash"),
+        name="y = x  (WTP = ESPN AV)",
+        hoverinfo="skip",
+    ))
+
+    for pos in POSITION_ORDER:
+        sub = plot_df[plot_df["position"] == pos]
+        if sub.empty:
+            continue
+        fig.add_trace(go.Scatter(
+            x=sub["wtp_price"],
+            y=sub["espn_av"],
+            mode="markers",
+            name=pos,
+            marker=dict(
+                color=POSITION_COLORS[pos],
+                size=10,
+                line=dict(color="white", width=0.5),
+            ),
+            customdata=sub[["player_name", "wtp_price", "espn_av"]],
+            hovertemplate=(
+                "<b>%{customdata[0]}</b><br>"
+                "WTP: $%{customdata[1]:.1f}<br>"
+                "ESPN Est.: $%{customdata[2]:.1f}"
+                "<extra></extra>"
+            ),
+        ))
+
+    fig.update_xaxes(range=[0, axis_max], title_text=f"WTP Shadow Price ($)  [{source_label} points]")
+    fig.update_yaxes(range=[0, axis_max], title_text="ESPN Estimated Auction Value ($)")
+    fig.update_layout(
+        title=dict(
+            text=f"WTP vs. ESPN Estimated Auction Value by Roster Slot"
+                 f"<br><sub>{source_label} points, 12-Team, Half-PPR</sub>",
+        ),
+        dragmode="zoom",
+        template="plotly_white",
+        legend_title_text="Position",
+        width=900,
+        height=750,
+    )
+
+    out_path = os.path.join(OUTPUT_DIR, f"wtp_vs_espn_estimates{suffix}.html")
+    fig.write_html(out_path, include_plotlyjs="cdn")
+    print(f"Saved: {out_path}")
+
+
+def plot_wtp_source_comparison(merged_df: pd.DataFrame, top_n: int = 25) -> None:
+    """
+    Grouped horizontal bar chart comparing WTP price across the three point
+    sources (historical / espn / blended) for the top-N roster slots (by
+    blended WTP). Used to sanity-check whether blending meaningfully changes
+    recommendations (Goal 10, Step 5).
+
+    Expects `merged_df` with columns:
+        roster_slot, position, wtp_historical, wtp_espn, wtp_blended
+
+    Saves to output/wtp_source_comparison.png.
+    """
+    _ensure_output_dir()
+
+    top = merged_df.nlargest(top_n, "wtp_blended").iloc[::-1].reset_index(drop=True)
+
+    y = np.arange(len(top))
+    height = 0.25
+
+    fig, ax = plt.subplots(figsize=(12, max(6, len(top) * 0.35)))
+    ax.barh(y - height, top["wtp_historical"], height=height, color="#0072B2", label="Historical")
+    ax.barh(y,          top["wtp_espn"],       height=height, color="#E69F00", label="ESPN")
+    ax.barh(y + height, top["wtp_blended"],    height=height, color="#009E73", label="Blended")
+
+    ax.set_yticks(y)
+    ax.set_yticklabels(top["roster_slot"], fontsize=9)
+    ax.set_xlabel("Willingness to Pay ($)", fontsize=11)
+    ax.set_title(
+        f"WTP by Roster Slot: Historical vs. ESPN vs. Blended (Top {top_n} by Blended WTP)",
+        fontsize=13, fontweight="bold",
+    )
+    ax.legend(fontsize=10, loc="lower right")
+    ax.grid(True, axis="x", color="lightgray", alpha=0.3)
+
+    plt.tight_layout()
+    out_path = os.path.join(OUTPUT_DIR, "wtp_source_comparison.png")
+    fig.savefig(out_path, dpi=150, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
 def export_csv(tier_summary_df: pd.DataFrame, cross_position_ranking_df: pd.DataFrame, suffix: str = "") -> None:
     """Export tier summary and cross-position ranking to CSV files."""
     os.makedirs(DATA_DIR, exist_ok=True)
