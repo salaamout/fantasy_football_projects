@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup
 # Paths
 # ---------------------------------------------------------------------------
 REPO_ROOT = Path(__file__).resolve().parent.parent
-INPUT_HTML = REPO_ROOT / "data" / "ESPN Salary Cap Draft List 26_09_01.html"
+INPUT_HTML = REPO_ROOT / "data" / "ESPN Salary Cap Draft List 26_09_07.html"
 OUTPUT_CSV = REPO_ROOT / "data" / "espn_projected_values.csv"
 
 # ---------------------------------------------------------------------------

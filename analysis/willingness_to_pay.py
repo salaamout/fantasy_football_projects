@@ -398,6 +398,7 @@ def solve_lp_relaxation(
     player_pool: pd.DataFrame,
     budget: int = SKILL_BUDGET,
     num_teams: int = NUM_TEAMS,
+    overrides: dict | None = None,
 ) -> tuple[pd.DataFrame, float, dict[str, float]]:
     """
     Solve the LP relaxation of the lineup optimizer (continuous vars ∈ [0,1]).
@@ -423,6 +424,20 @@ def solve_lp_relaxation(
         z_i ∈ [0,1]  — fills the FLEX slot (RB/WR/TE only)
         b_i ∈ [0,1]  — fills a bench slot (no QB/TE; ≤3 RB, ≤2 WR)
 
+    Parameters
+    ----------
+    overrides : dict | None
+        Goal 14 Step 4 (live draft recompute). When provided, replaces the
+        ``budget × num_teams`` / ``LINEUP_SLOTS[pos] × num_teams`` market
+        sizing with explicit remaining-market quantities — used when
+        re-solving the LP over only the still-available players mid-draft,
+        after some slots/budget have already been consumed league-wide.
+        Recognized keys (all required if ``overrides`` is given):
+        ``market_budget``, ``qb_slots``, ``rb_slots``, ``wr_slots``,
+        ``te_slots``, ``flex_slots``, ``bench_total``. ``bench_rb_max`` /
+        ``bench_wr_max`` are optional (pool-aware caps are still computed
+        and the tighter of the two is used).
+
     Returns
     -------
     (player_pool_with_duals, lambda_shadow_price, slot_duals)
@@ -437,28 +452,47 @@ def solve_lp_relaxation(
     players = player_pool.to_dict("records")
     n = len(players)
 
+    # --- Resolve market sizing: overrides (live recompute) or num_teams (batch) ---
+    if overrides is not None:
+        market_budget       = overrides["market_budget"]
+        qb_need              = overrides["qb_slots"]
+        rb_starters_needed   = overrides["rb_slots"]
+        wr_starters_needed   = overrides["wr_slots"]
+        te_need              = overrides["te_slots"]
+        flex_need            = overrides["flex_slots"]
+        bench_total_needed   = overrides["bench_total"]
+        bench_rb_max_override = overrides.get("bench_rb_max")
+        bench_wr_max_override = overrides.get("bench_wr_max")
+    else:
+        market_budget        = budget * num_teams
+        qb_need              = LINEUP_SLOTS["QB"] * num_teams
+        rb_starters_needed   = LINEUP_SLOTS["RB"] * num_teams
+        wr_starters_needed   = LINEUP_SLOTS["WR"] * num_teams
+        te_need              = LINEUP_SLOTS["TE"] * num_teams
+        flex_need            = LINEUP_SLOTS["FLEX"] * num_teams
+        bench_total_needed   = CROSS_BENCH_SLOTS * num_teams
+        bench_rb_max_override = None
+        bench_wr_max_override = None
+
     # --- Pre-flight pool depth validation ---
-    # The LP assigns each player to at most one slot.  For a num_teams-market
-    # LP to be feasible the pool must cover all starter + bench slots.
+    # The LP assigns each player to at most one slot.  For the market LP to
+    # be feasible the pool must cover all remaining starter + bench slots.
     pool_counts = {
         pos: sum(1 for p in players if p["position"] == pos)
         for pos in ("QB", "RB", "WR", "TE")
     }
-    rb_starters_needed = LINEUP_SLOTS["RB"] * num_teams    # 24
-    wr_starters_needed = LINEUP_SLOTS["WR"] * num_teams    # 36
-    bench_total_needed = CROSS_BENCH_SLOTS * num_teams     # 48
 
     # Pool-aware bench limits
     avail_rb_bench = pool_counts.get("RB", 0) - rb_starters_needed
     avail_wr_bench = pool_counts.get("WR", 0) - wr_starters_needed
-    max_bench_rb = min(3 * num_teams, avail_rb_bench)
-    max_bench_wr = min(2 * num_teams, avail_wr_bench)
+    max_bench_rb = min(bench_rb_max_override if bench_rb_max_override is not None else 3 * num_teams, max(avail_rb_bench, 0))
+    max_bench_wr = min(bench_wr_max_override if bench_wr_max_override is not None else 2 * num_teams, max(avail_wr_bench, 0))
 
     errors: list[str] = []
     # Starters-only minimums (QB / TE have no bench)
     for pos, need in [
-        ("QB", LINEUP_SLOTS["QB"] * num_teams),
-        ("TE", LINEUP_SLOTS["TE"] * num_teams),
+        ("QB", qb_need),
+        ("TE", te_need),
         ("RB", rb_starters_needed),
         ("WR", wr_starters_needed),
     ]:
@@ -517,48 +551,51 @@ def solve_lp_relaxation(
     )
 
     # Named budget constraint (we need its dual)
-    # Scale budget by num_teams to model the full 12-team competitive market.
-    market_budget = budget * num_teams
+    # `market_budget` is either `budget × num_teams` (batch mode) or the
+    # explicit remaining-market budget passed via `overrides` (live recompute).
     budget_constraint = pulp.lpSum(
         p["price"] * (y[i] + z[i] + b[i])
         for i, p in enumerate(players)
     ) <= market_budget
     prob += budget_constraint, "budget"
 
-    # Positional slot counts — scaled by num_teams to fill all rosters.
+    # Positional slot counts — either scaled by num_teams (batch) or the
+    # explicit remaining quotas from `overrides` (live recompute).
     prob += (pulp.lpSum(y[i] for i, p in enumerate(players) if p["position"] == "QB")
-             == LINEUP_SLOTS["QB"] * num_teams), "qb_slots"
+             == qb_need), "qb_slots"
     prob += (pulp.lpSum(y[i] for i, p in enumerate(players) if p["position"] == "RB")
-             == LINEUP_SLOTS["RB"] * num_teams), "rb_slots"
+             == rb_starters_needed), "rb_slots"
     prob += (pulp.lpSum(y[i] for i, p in enumerate(players) if p["position"] == "WR")
-             == LINEUP_SLOTS["WR"] * num_teams), "wr_slots"
+             == wr_starters_needed), "wr_slots"
     prob += (pulp.lpSum(y[i] for i, p in enumerate(players) if p["position"] == "TE")
-             == LINEUP_SLOTS["TE"] * num_teams), "te_slots"
+             == te_need), "te_slots"
 
-    # FLEX slots — scaled by num_teams
-    prob += pulp.lpSum(z) == LINEUP_SLOTS["FLEX"] * num_teams, "flex_slot"
+    # FLEX slots
+    prob += pulp.lpSum(z) == flex_need, "flex_slot"
 
-    # Bench — scaled by num_teams
-    prob += pulp.lpSum(b) == CROSS_BENCH_SLOTS * num_teams, "bench_count"
+    # Bench
+    prob += pulp.lpSum(b) == bench_total_needed, "bench_count"
 
-    # Bench composition — scaled by num_teams.
+    # Bench composition.
     # Cap bench maxima against actual pool size so we never add an infeasible
-    # constraint when the ESPN CSV is shallower than ideal.  The effective
+    # constraint when the pool is shallower than ideal.  The effective
     # maximum bench spots for a position is (pool_count − starters), ensuring
     # the LP can always satisfy the bench_count equality.
     n_rbs = sum(1 for p in players if p["position"] == "RB")
     n_wrs = sum(1 for p in players if p["position"] == "WR")
-    rb_starters = LINEUP_SLOTS["RB"] * num_teams   # 24
-    wr_starters = LINEUP_SLOTS["WR"] * num_teams   # 36
-    bench_total = CROSS_BENCH_SLOTS * num_teams     # 48
+    rb_starters = rb_starters_needed
+    wr_starters = wr_starters_needed
+    bench_total = bench_total_needed
+    default_bench_rb_cap = bench_rb_max_override if bench_rb_max_override is not None else 3 * num_teams
+    default_bench_wr_cap = bench_wr_max_override if bench_wr_max_override is not None else 2 * num_teams
 
     # Pool-aware caps: no more bench than (pool − starters) per position, and
     # no more than what still leaves enough room for the other position's bench.
-    bench_rb_max = min(3 * num_teams, n_rbs - rb_starters)
-    bench_wr_max = min(2 * num_teams, n_wrs - wr_starters)
+    bench_rb_max = min(default_bench_rb_cap, n_rbs - rb_starters)
+    bench_wr_max = min(default_bench_wr_cap, n_wrs - wr_starters)
     # Ensure both mins are satisfiable given pool-aware maxima
-    bench_rb_min = max(1 * num_teams, bench_total - bench_wr_max)
-    bench_wr_min = max(1 * num_teams, bench_total - bench_rb_max)
+    bench_rb_min = max(0, bench_total - bench_wr_max)
+    bench_wr_min = max(0, bench_total - bench_rb_max)
 
     prob += (pulp.lpSum(b[i] for i, p in enumerate(players) if p["position"] == "RB")
              <= bench_rb_max), "bench_rb_max"
@@ -630,11 +667,11 @@ def solve_lp_relaxation(
     # allocation (not just the marginal player), and it is what each team
     # actually "pays" per PAR point in the competitive market.
     n_pos_slots = {
-        "QB":   LINEUP_SLOTS["QB"]   * num_teams,
-        "RB":   LINEUP_SLOTS["RB"]   * num_teams,
-        "WR":   LINEUP_SLOTS["WR"]   * num_teams,
-        "TE":   LINEUP_SLOTS["TE"]   * num_teams,
-        "FLEX": LINEUP_SLOTS["FLEX"] * num_teams,
+        "QB":   qb_need,
+        "RB":   rb_starters_needed,
+        "WR":   wr_starters_needed,
+        "TE":   te_need,
+        "FLEX": flex_need,
     }
     total_slot_dual_contrib = sum(slot_duals[pos] * n_pos_slots[pos] for pos in n_pos_slots)
     total_par_starters = float(

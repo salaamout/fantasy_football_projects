@@ -27,11 +27,19 @@ ENV/
 # Data files (raw/output)
 data/raw/
 data/output/
+data/league_history_raw/
+data/ESPN SAL*
 *.csv
 *.parquet
 *.feather
 data/sleeper_players_cache.json
 data/sleeper_projections_cache/
+
+# Live draft web app state (per-draft, regenerated each season)
+data/draft_state.json
+
+# Generated analysis output
+output/
 
 # Jupyter checkpoints
 .ipynb_checkpoints/
